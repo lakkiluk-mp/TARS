@@ -30,6 +30,25 @@ export interface SessionContext {
   lastActivity: Date;
 }
 
+export interface ContextDetectionResult {
+  campaignId?: string;
+  campaignName?: string;
+  proposalId?: string;
+  proposalTitle?: string;
+  confidence: number;
+  needsClarification: boolean;
+  suggestedCampaigns?: { id: string; name: string }[];
+  suggestedProposals?: { id: string; title: string }[];
+}
+
+export interface BuiltContext {
+  globalContext: GlobalContext;
+  campaignContext?: CampaignContext;
+  proposalContext?: ProposalContext;
+  conversationHistory: ConversationMessage[];
+  sessionContext: SessionContext;
+}
+
 export interface KnowledgeFact {
   id: string;
   fact: string;

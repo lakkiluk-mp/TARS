@@ -8,6 +8,8 @@ import {
   KnowledgeFact,
   Conversation,
   ConversationMessage,
+  ContextDetectionResult,
+  BuiltContext,
 } from './types';
 
 const logger = createModuleLogger('context-manager');
@@ -83,7 +85,10 @@ export class ContextManager {
     );
 
     const history = changesResult.rows
-      .map((r) => `${r.created_at.toISOString().split('T')[0]}: ${r.action_type} - ${r.ai_reasoning || 'No reasoning'}`)
+      .map(
+        (r) =>
+          `${r.created_at.toISOString().split('T')[0]}: ${r.action_type} - ${r.ai_reasoning || 'No reasoning'}`
+      )
       .join('\n');
 
     // Get previous recommendations
@@ -342,10 +347,9 @@ export class ContextManager {
       content: string;
       metadata: Record<string, unknown>;
       created_at: Date;
-    }>(
-      'SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
-      [conversationId]
-    );
+    }>('SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC', [
+      conversationId,
+    ]);
 
     return result.rows.map((row) => ({
       id: row.id,
@@ -397,10 +401,10 @@ export class ContextManager {
   async finalizeConversation(conversationId: string, summary: string): Promise<void> {
     logger.info('Finalizing conversation', { conversationId });
 
-    await query(
-      `UPDATE conversations SET status = 'archived', summary = $1 WHERE id = $2`,
-      [summary, conversationId]
-    );
+    await query(`UPDATE conversations SET status = 'archived', summary = $1 WHERE id = $2`, [
+      summary,
+      conversationId,
+    ]);
   }
 
   /**
@@ -433,6 +437,233 @@ export class ContextManager {
       relatedCampaignId: row.related_campaign_id || undefined,
       createdAt: row.created_at,
     }));
+  }
+
+  /**
+   * Detect context from user message using AI classification result
+   */
+  async detectContext(
+    classificationResult: { campaign?: string; proposal?: string; confidence: number },
+    userId: string
+  ): Promise<ContextDetectionResult> {
+    logger.debug('Detecting context', { classificationResult, userId });
+
+    const result: ContextDetectionResult = {
+      confidence: classificationResult.confidence,
+      needsClarification: false,
+    };
+
+    // Try to find campaign by name or ID
+    if (classificationResult.campaign) {
+      const campaignResult = await query<{
+        id: string;
+        yandex_id: string;
+        name: string;
+      }>(
+        `SELECT id, yandex_id, name FROM campaigns
+         WHERE name ILIKE $1 OR yandex_id = $2
+         LIMIT 5`,
+        [`%${classificationResult.campaign}%`, classificationResult.campaign]
+      );
+
+      if (campaignResult.rows.length === 1) {
+        result.campaignId = campaignResult.rows[0].yandex_id;
+        result.campaignName = campaignResult.rows[0].name;
+      } else if (campaignResult.rows.length > 1) {
+        result.needsClarification = true;
+        result.suggestedCampaigns = campaignResult.rows.map((r) => ({
+          id: r.yandex_id,
+          name: r.name,
+        }));
+      }
+    }
+
+    // Try to find proposal by title
+    if (classificationResult.proposal) {
+      const proposalResult = await query<{
+        id: string;
+        title: string;
+      }>(
+        `SELECT id, title FROM proposals
+         WHERE title ILIKE $1 AND status != 'rejected'
+         LIMIT 5`,
+        [`%${classificationResult.proposal}%`]
+      );
+
+      if (proposalResult.rows.length === 1) {
+        result.proposalId = proposalResult.rows[0].id;
+        result.proposalTitle = proposalResult.rows[0].title;
+      } else if (proposalResult.rows.length > 1) {
+        result.needsClarification = true;
+        result.suggestedProposals = proposalResult.rows.map((r) => ({
+          id: r.id,
+          title: r.title,
+        }));
+      }
+    }
+
+    // If no context detected and confidence is low, suggest available campaigns
+    if (!result.campaignId && !result.proposalId && classificationResult.confidence < 0.5) {
+      const campaignsResult = await query<{
+        yandex_id: string;
+        name: string;
+      }>('SELECT yandex_id, name FROM campaigns WHERE status = $1 LIMIT 5', ['active']);
+
+      if (campaignsResult.rows.length > 0) {
+        result.needsClarification = true;
+        result.suggestedCampaigns = campaignsResult.rows.map((r) => ({
+          id: r.yandex_id,
+          name: r.name,
+        }));
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Build full context for answering a question
+   */
+  async buildContextForQuestion(
+    userId: string,
+    detectedContext?: ContextDetectionResult
+  ): Promise<BuiltContext> {
+    logger.debug('Building context for question', { userId, detectedContext });
+
+    // Get session
+    const session = await this.getSession(userId);
+
+    // Get global context
+    const globalContext = await this.getGlobalContext();
+
+    // Determine which campaign/proposal to use
+    const campaignId = detectedContext?.campaignId || session.currentCampaignId;
+    const proposalId = detectedContext?.proposalId || session.currentProposalId;
+
+    // Get campaign context if available
+    let campaignContext: CampaignContext | undefined;
+    if (campaignId) {
+      const ctx = await this.getCampaignContext(campaignId);
+      if (ctx) {
+        campaignContext = ctx;
+      }
+    }
+
+    // Get proposal context if available
+    let proposalContext: ProposalContext | undefined;
+    if (proposalId) {
+      const ctx = await this.getProposalContext(proposalId);
+      if (ctx) {
+        proposalContext = ctx;
+      }
+    }
+
+    // Get conversation history
+    let conversationHistory: ConversationMessage[] = [];
+    if (session.currentConversationId) {
+      conversationHistory = await this.getConversationMessages(session.currentConversationId);
+    }
+
+    return {
+      globalContext,
+      campaignContext,
+      proposalContext,
+      conversationHistory,
+      sessionContext: session,
+    };
+  }
+
+  /**
+   * Set current campaign for user session
+   */
+  async setCurrentCampaign(userId: string, campaignId: string): Promise<void> {
+    logger.info('Setting current campaign', { userId, campaignId });
+
+    // Find campaign by yandex_id
+    const campaignResult = await query<{ id: string }>(
+      'SELECT id FROM campaigns WHERE yandex_id = $1',
+      [campaignId]
+    );
+
+    if (campaignResult.rows.length === 0) {
+      throw new Error(`Campaign not found: ${campaignId}`);
+    }
+
+    // Create or get conversation for this campaign
+    const conversation = await this.getOrCreateConversation(
+      'campaign_analysis',
+      campaignResult.rows[0].id
+    );
+
+    await this.updateSession(userId, {
+      currentCampaignId: campaignResult.rows[0].id,
+      currentConversationId: conversation.id,
+      currentProposalId: null,
+    });
+  }
+
+  /**
+   * Set current proposal for user session
+   */
+  async setCurrentProposal(userId: string, proposalId: string): Promise<void> {
+    logger.info('Setting current proposal', { userId, proposalId });
+
+    // Find proposal
+    const proposalResult = await query<{ id: string; conversation_id: string }>(
+      'SELECT id, conversation_id FROM proposals WHERE id = $1',
+      [proposalId]
+    );
+
+    if (proposalResult.rows.length === 0) {
+      throw new Error(`Proposal not found: ${proposalId}`);
+    }
+
+    await this.updateSession(userId, {
+      currentProposalId: proposalId,
+      currentConversationId: proposalResult.rows[0].conversation_id,
+      currentCampaignId: null,
+    });
+  }
+
+  /**
+   * Clear current context (reset to general)
+   */
+  async clearCurrentContext(userId: string): Promise<void> {
+    logger.info('Clearing current context', { userId });
+
+    // Create general conversation
+    const conversation = await this.getOrCreateConversation('general');
+
+    await this.updateSession(userId, {
+      currentCampaignId: null,
+      currentProposalId: null,
+      currentConversationId: conversation.id,
+    });
+  }
+
+  /**
+   * Get list of active campaigns for selection
+   */
+  async getActiveCampaigns(): Promise<{ id: string; name: string }[]> {
+    const result = await query<{ yandex_id: string; name: string }>(
+      'SELECT yandex_id, name FROM campaigns WHERE status = $1 ORDER BY name',
+      ['active']
+    );
+
+    return result.rows.map((r) => ({ id: r.yandex_id, name: r.name }));
+  }
+
+  /**
+   * Get list of active proposals for selection
+   */
+  async getActiveProposals(): Promise<{ id: string; title: string; status: string }[]> {
+    const result = await query<{ id: string; title: string; status: string }>(
+      `SELECT id, title, status FROM proposals
+       WHERE status NOT IN ('rejected', 'implemented')
+       ORDER BY created_at DESC`
+    );
+
+    return result.rows;
   }
 }
 

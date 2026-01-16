@@ -4,7 +4,12 @@ import {
   createMainMenuKeyboard,
   createCampaignKeyboard,
   createRecommendationKeyboard,
+  createProposalKeyboard,
+  createCampaignClarificationKeyboard,
+  createProposalClarificationKeyboard,
+  createCurrentContextKeyboard,
 } from './keyboards';
+import { ContextLoader } from '../context';
 
 const logger = createModuleLogger('telegram-handlers');
 
@@ -17,14 +22,31 @@ export interface BotContext extends Context {
   };
 }
 
+// Clarification response type
+export interface ClarificationResponse {
+  needsClarification: true;
+  message: string;
+  campaigns?: { id: string; name: string }[];
+  proposals?: { id: string; title: string }[];
+}
+
 // Orchestrator interface (will be injected)
 export interface Orchestrator {
   generateDailyReport(): Promise<{ text: string; recommendations: unknown[] }>;
   generateWeeklyReport(): Promise<{ text: string; recommendations: unknown[] }>;
-  getCampaigns(): Promise<{ id: string; name: string }[]>;
-  handleUserQuestion(question: string, userId: string): Promise<string>;
+  getCampaigns(filter?: 'active' | 'all'): Promise<{ id: string; name: string; status?: string }[]>;
+  getProposals(): Promise<{ id: string; title: string; status: string }[]>;
+  handleUserQuestion(question: string, userId: string): Promise<string | ClarificationResponse>;
   executeAction(actionId: string): Promise<void>;
   getAIUsageStats(): string;
+  setCurrentCampaign(userId: string, campaignId: string): Promise<void>;
+  setCurrentProposal(userId: string, proposalId: string): Promise<void>;
+  clearCurrentContext(userId: string): Promise<void>;
+  getCurrentContext(userId: string): Promise<{
+    campaign?: { id: string; name: string };
+    proposal?: { id: string; title: string };
+  }>;
+  syncYandexData(mode?: 'full' | 'recent'): Promise<void>;
 }
 
 let orchestrator: Orchestrator | null = null;
@@ -86,15 +108,22 @@ export async function handleHelp(ctx: BotContext): Promise<void> {
 /report — отчёт за вчера
 /week — недельный отчёт
 /campaigns — список кампаний
+/proposals — список предложений
 /analyze [кампания] — анализ кампании
 
-*Вопросы и диалог:*
+*Контекст и диалог:*
+/campaign [id] — переключиться на кампанию
+/proposal [id] — переключиться на предложение
+/context — показать текущий контекст
+/clear — сбросить контекст
+
+*Вопросы:*
 /ask [вопрос] — задать вопрос AI
 Или просто напиши сообщение — я пойму!
 
 *Управление:*
 /settings — настройки
-/debug — режим отладки (для разработки)
+/usage — статистика AI
 
 *Примеры вопросов:*
 • "Почему упал CTR в кампании X?"
@@ -182,13 +211,168 @@ export async function handleCampaigns(ctx: BotContext): Promise<void> {
       return;
     }
 
-    await ctx.reply('🎯 *Ваши кампании:*\n\nВыберите кампанию для анализа:', {
+    await ctx.reply('🎯 *Ваши кампании:*\n\nВыберите кампанию для переключения контекста:', {
       parse_mode: 'Markdown',
       reply_markup: createCampaignKeyboard(campaigns),
     });
   } catch (error) {
     logger.error('Failed to get campaigns', { error });
     await ctx.reply('❌ Не удалось получить список кампаний');
+  }
+}
+
+/**
+ * Handle /proposals command
+ */
+export async function handleProposals(ctx: BotContext): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  logger.info('Proposals command received', { userId: ctx.from?.id });
+
+  try {
+    const proposals = await orchestrator.getProposals();
+
+    if (proposals.length === 0) {
+      await ctx.reply('📭 Предложения не найдены');
+      return;
+    }
+
+    await ctx.reply('💡 *Предложения:*\n\nВыберите предложение для обсуждения:', {
+      parse_mode: 'Markdown',
+      reply_markup: createProposalKeyboard(proposals),
+    });
+  } catch (error) {
+    logger.error('Failed to get proposals', { error });
+    await ctx.reply('❌ Не удалось получить список предложений');
+  }
+}
+
+/**
+ * Handle /campaign [id] command - switch to campaign context
+ */
+export async function handleCampaignSwitch(ctx: BotContext, campaignId: string): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  const userId = ctx.from?.id?.toString() || 'unknown';
+
+  if (!campaignId.trim()) {
+    // Show campaign list for selection
+    await handleCampaigns(ctx);
+    return;
+  }
+
+  logger.info('Campaign switch command received', { userId, campaignId });
+
+  try {
+    await orchestrator.setCurrentCampaign(userId, campaignId);
+    await ctx.reply(`✅ Контекст переключён на кампанию *${campaignId}*\n\nТеперь все вопросы будут относиться к этой кампании.`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    logger.error('Failed to switch campaign', { error });
+    await ctx.reply('❌ Не удалось переключить контекст. Проверьте ID кампании.');
+  }
+}
+
+/**
+ * Handle /proposal [id] command - switch to proposal context
+ */
+export async function handleProposalSwitch(ctx: BotContext, proposalId: string): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  const userId = ctx.from?.id?.toString() || 'unknown';
+
+  if (!proposalId.trim()) {
+    // Show proposal list for selection
+    await handleProposals(ctx);
+    return;
+  }
+
+  logger.info('Proposal switch command received', { userId, proposalId });
+
+  try {
+    await orchestrator.setCurrentProposal(userId, proposalId);
+    await ctx.reply(`✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    logger.error('Failed to switch proposal', { error });
+    await ctx.reply('❌ Не удалось переключить контекст. Проверьте ID предложения.');
+  }
+}
+
+/**
+ * Handle /context command - show current context
+ */
+export async function handleShowContext(ctx: BotContext): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  const userId = ctx.from?.id?.toString() || 'unknown';
+
+  logger.info('Show context command received', { userId });
+
+  try {
+    const context = await orchestrator.getCurrentContext(userId);
+
+    let message = '📍 *Текущий контекст:*\n\n';
+
+    if (context.campaign) {
+      message += `🎯 Кампания: *${context.campaign.name}*\n`;
+    }
+
+    if (context.proposal) {
+      message += `💡 Предложение: *${context.proposal.title}*\n`;
+    }
+
+    if (!context.campaign && !context.proposal) {
+      message += '🌐 Общий контекст (без привязки к кампании)\n';
+    }
+
+    message += '\nВсе вопросы будут анализироваться в этом контексте.';
+
+    await ctx.reply(message, {
+      parse_mode: 'Markdown',
+      reply_markup: createCurrentContextKeyboard(context.campaign, context.proposal),
+    });
+  } catch (error) {
+    logger.error('Failed to get context', { error });
+    await ctx.reply('❌ Не удалось получить текущий контекст');
+  }
+}
+
+/**
+ * Handle /clear command - clear current context
+ */
+export async function handleClearContext(ctx: BotContext): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  const userId = ctx.from?.id?.toString() || 'unknown';
+
+  logger.info('Clear context command received', { userId });
+
+  try {
+    await orchestrator.clearCurrentContext(userId);
+    await ctx.reply('✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.', {
+      parse_mode: 'Markdown',
+    });
+  } catch (error) {
+    logger.error('Failed to clear context', { error });
+    await ctx.reply('❌ Не удалось сбросить контекст');
   }
 }
 
@@ -212,8 +396,28 @@ export async function handleAsk(ctx: BotContext, question: string): Promise<void
 
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
-    const answer = await orchestrator.handleUserQuestion(question, userId);
-    await ctx.reply(answer, { parse_mode: 'Markdown' });
+    const result = await orchestrator.handleUserQuestion(question, userId);
+    
+    // Check if clarification is needed
+    if (typeof result === 'object' && result.needsClarification) {
+      // Show clarification keyboard
+      if (result.campaigns && result.campaigns.length > 0) {
+        await ctx.reply(result.message, {
+          parse_mode: 'Markdown',
+          reply_markup: createCampaignClarificationKeyboard(result.campaigns),
+        });
+      } else if (result.proposals && result.proposals.length > 0) {
+        await ctx.reply(result.message, {
+          parse_mode: 'Markdown',
+          reply_markup: createProposalClarificationKeyboard(result.proposals),
+        });
+      } else {
+        await ctx.reply('❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.');
+      }
+    } else {
+      // Normal answer
+      await ctx.reply(result as string, { parse_mode: 'Markdown' });
+    }
   } catch (error) {
     logger.error('Failed to answer question', { error });
     await ctx.reply('❌ Не удалось обработать вопрос. Попробуйте переформулировать.');
@@ -238,8 +442,28 @@ export async function handleMessage(ctx: BotContext): Promise<void> {
 
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
-    const answer = await orchestrator.handleUserQuestion(text, userId);
-    await ctx.reply(answer, { parse_mode: 'Markdown' });
+    const result = await orchestrator.handleUserQuestion(text, userId);
+    
+    // Check if clarification is needed
+    if (typeof result === 'object' && result.needsClarification) {
+      // Show clarification keyboard
+      if (result.campaigns && result.campaigns.length > 0) {
+        await ctx.reply(result.message, {
+          parse_mode: 'Markdown',
+          reply_markup: createCampaignClarificationKeyboard(result.campaigns),
+        });
+      } else if (result.proposals && result.proposals.length > 0) {
+        await ctx.reply(result.message, {
+          parse_mode: 'Markdown',
+          reply_markup: createProposalClarificationKeyboard(result.proposals),
+        });
+      } else {
+        await ctx.reply('❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.');
+      }
+    } else {
+      // Normal answer
+      await ctx.reply(result as string, { parse_mode: 'Markdown' });
+    }
   } catch (error) {
     logger.error('Failed to handle message', { error });
     await ctx.reply('❌ Не удалось обработать сообщение. Попробуйте ещё раз.');
@@ -263,6 +487,8 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
 
   const [action, ...params] = data.split(':');
   const param = params.join(':');
+
+  const userId = ctx.from?.id?.toString() || 'unknown';
 
   try {
     switch (action) {
@@ -293,7 +519,28 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
         break;
 
       case 'campaign':
-        await handleCampaignCallback(ctx, param);
+        await handleCampaignCallback(ctx, param, userId);
+        break;
+
+      case 'proposal':
+        await handleProposalCallback(ctx, param, userId);
+        break;
+
+      case 'set_campaign':
+        await handleSetCampaignCallback(ctx, param, userId);
+        break;
+
+      case 'set_proposal':
+        await handleSetProposalCallback(ctx, param, userId);
+        break;
+
+      case 'clear_context':
+        await handleClearContextCallback(ctx, userId);
+        break;
+
+      case 'cancel_clarification':
+        await ctx.answerCbQuery('Отменено');
+        await ctx.editMessageText('❌ Выбор отменён');
         break;
 
       case 'period':
@@ -333,7 +580,7 @@ async function handleMenuCallback(ctx: BotContext, menu: string): Promise<void> 
       await handleCampaigns(ctx);
       break;
     case 'proposals':
-      await ctx.reply('💡 Предложения будут доступны в следующей версии');
+      await handleProposals(ctx);
       break;
     case 'settings':
       await ctx.reply('⚙️ Настройки будут доступны в следующей версии');
@@ -365,17 +612,88 @@ export async function handleUsageStats(ctx: BotContext): Promise<void> {
 }
 
 /**
- * Handle campaign selection callback
+ * Handle campaign selection callback - switch context to campaign
  */
-async function handleCampaignCallback(ctx: BotContext, campaignId: string): Promise<void> {
-  await ctx.answerCbQuery();
+async function handleCampaignCallback(ctx: BotContext, campaignId: string, userId: string): Promise<void> {
+  await ctx.answerCbQuery('Переключаю контекст...');
 
-  if (ctx.session) {
-    ctx.session.currentCampaignId = campaignId;
+  if (!orchestrator) return;
+
+  try {
+    await orchestrator.setCurrentCampaign(userId, campaignId);
+    await ctx.editMessageText(`✅ Контекст переключён на кампанию\n\nТеперь все вопросы будут относиться к этой кампании.`);
+  } catch (error) {
+    logger.error('Failed to switch campaign context', { error });
+    await ctx.reply('❌ Не удалось переключить контекст');
   }
+}
 
-  await ctx.reply(`📊 Анализирую кампанию ${campaignId}...`);
-  // TODO: Trigger campaign analysis
+/**
+ * Handle proposal selection callback - switch context to proposal
+ */
+async function handleProposalCallback(ctx: BotContext, proposalId: string, userId: string): Promise<void> {
+  await ctx.answerCbQuery('Переключаю контекст...');
+
+  if (!orchestrator) return;
+
+  try {
+    await orchestrator.setCurrentProposal(userId, proposalId);
+    await ctx.editMessageText(`✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`);
+  } catch (error) {
+    logger.error('Failed to switch proposal context', { error });
+    await ctx.reply('❌ Не удалось переключить контекст');
+  }
+}
+
+/**
+ * Handle set campaign callback from clarification keyboard
+ */
+async function handleSetCampaignCallback(ctx: BotContext, campaignId: string, userId: string): Promise<void> {
+  await ctx.answerCbQuery('Выбрано');
+
+  if (!orchestrator) return;
+
+  try {
+    await orchestrator.setCurrentCampaign(userId, campaignId);
+    await ctx.editMessageText(`✅ Выбрана кампания. Контекст установлен.`);
+  } catch (error) {
+    logger.error('Failed to set campaign', { error });
+    await ctx.reply('❌ Не удалось установить кампанию');
+  }
+}
+
+/**
+ * Handle set proposal callback from clarification keyboard
+ */
+async function handleSetProposalCallback(ctx: BotContext, proposalId: string, userId: string): Promise<void> {
+  await ctx.answerCbQuery('Выбрано');
+
+  if (!orchestrator) return;
+
+  try {
+    await orchestrator.setCurrentProposal(userId, proposalId);
+    await ctx.editMessageText(`✅ Выбрано предложение. Контекст установлен.`);
+  } catch (error) {
+    logger.error('Failed to set proposal', { error });
+    await ctx.reply('❌ Не удалось установить предложение');
+  }
+}
+
+/**
+ * Handle clear context callback
+ */
+async function handleClearContextCallback(ctx: BotContext, userId: string): Promise<void> {
+  await ctx.answerCbQuery('Сбрасываю контекст...');
+
+  if (!orchestrator) return;
+
+  try {
+    await orchestrator.clearCurrentContext(userId);
+    await ctx.editMessageText(`✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.`);
+  } catch (error) {
+    logger.error('Failed to clear context', { error });
+    await ctx.reply('❌ Не удалось сбросить контекст');
+  }
 }
 
 /**
@@ -387,6 +705,126 @@ async function handlePeriodCallback(ctx: BotContext, period: string): Promise<vo
   // TODO: Generate report for selected period
 }
 
+/**
+ * Handle /load_context command - load initial context from .md files
+ */
+export async function handleLoadContext(ctx: BotContext, category?: string): Promise<void> {
+  logger.info('Load context command received', { userId: ctx.from?.id, category });
+
+  await ctx.reply('📥 Загружаю контекст из файлов...');
+
+  try {
+    const loader = new ContextLoader();
+
+    let result;
+    if (category && category.trim()) {
+      result = await loader.loadCategory(category.trim());
+    } else {
+      result = await loader.loadAllContext();
+    }
+
+    let message = `✅ *Контекст загружен*\n\n`;
+    message += `📄 Загружено файлов: ${result.loaded}\n`;
+    message += `⏭️ Пропущено: ${result.skipped}\n`;
+
+    if (result.files.length > 0) {
+      message += `\n*Загруженные файлы:*\n`;
+      for (const file of result.files) {
+        message += `• ${file.category}/${file.filename}\n`;
+      }
+    }
+
+    if (result.errors.length > 0) {
+      message += `\n⚠️ *Ошибки:*\n`;
+      for (const error of result.errors) {
+        message += `• ${error}\n`;
+      }
+    }
+
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+  } catch (error) {
+    logger.error('Failed to load context', { error });
+    await ctx.reply('❌ Не удалось загрузить контекст');
+  }
+}
+
+/**
+ * Handle /list_context command - show available context files
+ */
+export async function handleListContext(ctx: BotContext): Promise<void> {
+  logger.info('List context command received', { userId: ctx.from?.id });
+
+  try {
+    const loader = new ContextLoader();
+    const available = loader.getAvailableFiles();
+
+    if (available.length === 0) {
+      await ctx.reply('📭 Файлы контекста не найдены\n\nСоздайте .md файлы в папке context/');
+      return;
+    }
+
+    let message = '📂 *Доступные файлы контекста:*\n\n';
+
+    for (const category of available) {
+      message += `*${category.category}/*\n`;
+      for (const file of category.files) {
+        message += `  • ${file}\n`;
+      }
+      message += '\n';
+    }
+
+    message += '\nИспользуйте /load\\_context для загрузки всех файлов\n';
+    message += 'или /load\\_context [категория] для загрузки конкретной категории';
+
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+  } catch (error) {
+    logger.error('Failed to list context', { error });
+    await ctx.reply('❌ Не удалось получить список файлов');
+  }
+}
+
+/**
+ * Handle /clear_knowledge command - clear initial context from knowledge base
+ */
+export async function handleClearKnowledge(ctx: BotContext): Promise<void> {
+  logger.info('Clear knowledge command received', { userId: ctx.from?.id });
+
+  try {
+    const loader = new ContextLoader();
+    const count = await loader.clearInitialContext();
+
+    await ctx.reply(`✅ Удалено ${count} записей из базы знаний`, { parse_mode: 'Markdown' });
+  } catch (error) {
+    logger.error('Failed to clear knowledge', { error });
+    await ctx.reply('❌ Не удалось очистить базу знаний');
+  }
+}
+
+/**
+ * Handle /sync command - sync data from Yandex.Direct
+ */
+export async function handleSync(ctx: BotContext, mode?: string): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  logger.info('Sync command received', { userId: ctx.from?.id, mode });
+
+  const syncMode = mode === 'full' ? 'full' : 'recent';
+  const modeText = syncMode === 'full' ? 'полную (90 дней)' : 'быструю (7 дней)';
+
+  await ctx.reply(`🔄 Запускаю ${modeText} синхронизацию данных...`);
+
+  try {
+    await orchestrator.syncYandexData(syncMode);
+    await ctx.reply(`✅ Синхронизация завершена!`, { parse_mode: 'Markdown' });
+  } catch (error) {
+    logger.error('Failed to sync data', { error });
+    await ctx.reply('❌ Не удалось синхронизировать данные');
+  }
+}
+
 export default {
   setOrchestrator,
   isAuthorized,
@@ -395,7 +833,17 @@ export default {
   handleReport,
   handleWeekReport,
   handleCampaigns,
+  handleProposals,
+  handleCampaignSwitch,
+  handleProposalSwitch,
+  handleShowContext,
+  handleClearContext,
   handleAsk,
   handleMessage,
   handleCallback,
+  handleUsageStats,
+  handleLoadContext,
+  handleListContext,
+  handleClearKnowledge,
+  handleSync,
 };

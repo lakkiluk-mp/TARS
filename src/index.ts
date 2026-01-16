@@ -6,6 +6,7 @@ import { initDatabase, checkConnection, closeDatabase } from './database/client'
 import { YandexDirectClient } from './modules/yandex';
 import { AIEngine } from './modules/ai';
 import { TelegramBot } from './modules/telegram';
+import { ContextManager } from './modules/context';
 import { Orchestrator } from './modules/orchestrator';
 import { initScheduler, startScheduler, stopScheduler } from './modules/scheduler';
 
@@ -74,14 +75,19 @@ async function main() {
     const telegramBot = new TelegramBot(config.telegram);
     logger.info('✅ Telegram Bot initialized');
 
-    // 6. Initialize Orchestrator
+    // 6. Initialize Context Manager
+    logger.info('Initializing Context Manager...');
+    const contextManager = new ContextManager();
+    logger.info('✅ Context Manager initialized');
+
+    // 7. Initialize Orchestrator
     logger.info('Initializing Orchestrator...');
-    const orchestrator = new Orchestrator(yandexClient, aiEngine, telegramBot, {
+    const orchestrator = new Orchestrator(yandexClient, aiEngine, telegramBot, contextManager, {
       debugMode: config.debug,
     });
     logger.info('✅ Orchestrator initialized');
 
-    // 7. Initialize Scheduler
+    // 8. Initialize Scheduler
     logger.info('Initializing Scheduler...');
     initScheduler(
       {
@@ -110,11 +116,11 @@ async function main() {
     startScheduler();
     logger.info('✅ Scheduler started');
 
-    // 8. Start Telegram Bot
+    // 9. Start Telegram Bot
     await telegramBot.start();
     logger.info('✅ Telegram Bot started');
 
-    // 9. Send startup notification
+    // 10. Send startup notification
     await telegramBot.sendToAdmin('🚀 TARS запущен и готов к работе!', { parse_mode: 'Markdown' });
 
     logger.info('✅ Application started successfully');

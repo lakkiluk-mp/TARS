@@ -10,10 +10,19 @@ import {
   handleReport,
   handleWeekReport,
   handleCampaigns,
+  handleProposals,
+  handleCampaignSwitch,
+  handleProposalSwitch,
+  handleShowContext,
+  handleClearContext,
   handleAsk,
   handleUsageStats,
   handleMessage,
   handleCallback,
+  handleLoadContext,
+  handleListContext,
+  handleClearKnowledge,
+  handleSync,
 } from './handlers';
 
 const logger = createModuleLogger('telegram-bot');
@@ -93,6 +102,23 @@ export class TelegramBot {
     this.bot.command('report', handleReport);
     this.bot.command('week', handleWeekReport);
     this.bot.command('campaigns', handleCampaigns);
+    this.bot.command('proposals', handleProposals);
+
+    // Context management commands
+    this.bot.command('campaign', async (ctx) => {
+      const text = ctx.message.text;
+      const campaignId = text.replace(/^\/campaign\s*/, '').trim();
+      await handleCampaignSwitch(ctx, campaignId);
+    });
+
+    this.bot.command('proposal', async (ctx) => {
+      const text = ctx.message.text;
+      const proposalId = text.replace(/^\/proposal\s*/, '').trim();
+      await handleProposalSwitch(ctx, proposalId);
+    });
+
+    this.bot.command('context', handleShowContext);
+    this.bot.command('clear', handleClearContext);
 
     this.bot.command('ask', async (ctx) => {
       const text = ctx.message.text;
@@ -101,6 +127,23 @@ export class TelegramBot {
     });
 
     this.bot.command('usage', handleUsageStats);
+
+    // Context loading commands
+    this.bot.command('load_context', async (ctx) => {
+      const text = ctx.message.text;
+      const category = text.replace(/^\/load_context\s*/, '').trim();
+      await handleLoadContext(ctx, category || undefined);
+    });
+
+    this.bot.command('list_context', handleListContext);
+    this.bot.command('clear_knowledge', handleClearKnowledge);
+
+    // Sync command
+    this.bot.command('sync', async (ctx) => {
+      const text = ctx.message.text;
+      const mode = text.replace(/^\/sync\s*/, '').trim();
+      await handleSync(ctx, mode || undefined);
+    });
 
     this.bot.command('analyze', async (ctx) => {
       const text = ctx.message.text;
@@ -189,7 +232,13 @@ export class TelegramBot {
         { command: 'report', description: '📊 Отчёт за сегодня' },
         { command: 'week', description: '📈 Отчёт за неделю' },
         { command: 'campaigns', description: '📋 Список кампаний' },
+        { command: 'proposals', description: '💡 Список предложений' },
+        { command: 'context', description: '📍 Текущий контекст' },
+        { command: 'clear', description: '🔄 Сбросить контекст' },
         { command: 'ask', description: '❓ Задать вопрос AI' },
+        { command: 'sync', description: '🔄 Синхронизация данных' },
+        { command: 'load_context', description: '📥 Загрузить контекст из файлов' },
+        { command: 'list_context', description: '📂 Список файлов контекста' },
         { command: 'usage', description: '📉 Статистика AI' },
         { command: 'help', description: '❔ Помощь' },
       ]);

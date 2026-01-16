@@ -33,7 +33,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./src/database/migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "5437:5432"
     networks:
       - tars-network
     healthcheck:

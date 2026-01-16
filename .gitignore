@@ -1,4 +1,4 @@
-# Dependencies
+/# Dependencies
 node_modules/
 
 # Build output
@@ -40,3 +40,11 @@ ai/
 actions/
 TARS-implementation-plan.md
 SETUP_GUIDE.md
+AGENTS.md
+CLAUDE.md
+context/goals.md
+context/README.md
+context/campaigns/Hot warm launch 14jan.md
+context/campaigns/Perfomance campaign archive.md
+context/experiments/Minus words exclamation fail.md
+context/learnings/Key insights.md

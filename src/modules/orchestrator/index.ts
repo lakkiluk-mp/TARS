@@ -1,8 +1,9 @@
 import { createModuleLogger } from '../../utils/logger';
 import { formatDate, getYesterday, getDaysAgo, getWeekStart } from '../../utils/helpers';
 import { YandexDirectClient, CampaignStats } from '../yandex';
-import { AIEngine, AnalysisResponse, CampaignData, Recommendation } from '../ai';
+import { AIEngine, AnalysisResponse, CampaignData, Recommendation, AnalysisContext } from '../ai';
 import { TelegramBot } from '../telegram';
+import { ContextManager, BuiltContext } from '../context';
 import { campaignsRepo, dailyStatsRepo } from '../../database/repositories';
 import { query } from '../../database/client';
 
@@ -16,17 +17,20 @@ export class Orchestrator {
   private yandex: YandexDirectClient;
   private ai: AIEngine;
   private telegram: TelegramBot;
+  private context: ContextManager;
   private config: OrchestratorConfig;
 
   constructor(
     yandex: YandexDirectClient,
     ai: AIEngine,
     telegram: TelegramBot,
+    context: ContextManager,
     config: OrchestratorConfig = {}
   ) {
     this.yandex = yandex;
     this.ai = ai;
     this.telegram = telegram;
+    this.context = context;
     this.config = config;
 
     // Set orchestrator in telegram handlers
@@ -66,7 +70,10 @@ export class Orchestrator {
       // 6. Format and send report
       const reportText = this.formatDailyReport(analysis, stats);
 
-      await this.telegram.sendReport(reportText, analysis.recommendations as { id: string; title: string; description: string }[]);
+      await this.telegram.sendReport(
+        reportText,
+        analysis.recommendations as { id: string; title: string; description: string }[]
+      );
 
       logger.info('Daily report generated and sent');
 
@@ -163,13 +170,15 @@ export class Orchestrator {
 
   /**
    * Sync Yandex data
+   * @param mode - 'full' for 90 days history, 'recent' for 7 days (default)
    */
-  async syncYandexData(): Promise<void> {
-    logger.info('Syncing Yandex data...');
+  async syncYandexData(mode: 'full' | 'recent' = 'recent'): Promise<void> {
+    const historyDays = mode === 'full' ? 90 : 7;
+    logger.info(`Syncing Yandex data (mode: ${mode}, days: ${historyDays})...`);
 
     try {
-      // 1. Sync campaigns
-      const campaigns = await this.yandex.getCampaigns();
+      // 1. Sync ALL campaigns (including inactive)
+      const campaigns = await this.yandex.getCampaigns('all');
 
       for (const campaign of campaigns) {
         await campaignsRepo.upsertFromYandex(
@@ -179,16 +188,16 @@ export class Orchestrator {
         );
       }
 
-      logger.info(`Synced ${campaigns.length} campaigns`);
+      logger.info(`Synced ${campaigns.length} campaigns (all statuses)`);
 
-      // 2. Sync recent stats (last 7 days)
-      const weekAgo = formatDate(getDaysAgo(7));
+      // 2. Sync stats for the specified period
+      const startDate = formatDate(getDaysAgo(historyDays));
       const today = formatDate(new Date());
-      const stats = await this.yandex.getStats(weekAgo, today);
+      const stats = await this.yandex.getStats(startDate, today);
 
       await this.saveStats(stats);
 
-      logger.info(`Synced ${stats.length} stat records`);
+      logger.info(`Synced ${stats.length} stat records for ${historyDays} days`);
     } catch (error) {
       logger.error('Data sync failed', { error });
       throw error;
@@ -196,69 +205,79 @@ export class Orchestrator {
   }
 
   /**
-   * Handle user question
+   * Handle user question with context
+   * Returns either an answer string or a clarification request object
    */
-  async handleUserQuestion(question: string, userId: string): Promise<string> {
+  async handleUserQuestion(
+    question: string,
+    userId: string
+  ): Promise<
+    | string
+    | {
+        needsClarification: true;
+        message: string;
+        campaigns?: { id: string; name: string }[];
+        proposals?: { id: string; title: string }[];
+      }
+  > {
     logger.info('Handling user question', { userId, question: question.substring(0, 50) });
 
     try {
       // 1. Classify the question
       const classification = await this.ai.classify(question);
 
-      // 2. Get relevant data
-      let campaignData: CampaignData[] = [];
+      // 2. Detect context from classification
+      const detectedContext = await this.context.detectContext(classification, userId);
 
-      if (classification.campaign) {
-        // Get specific campaign data
-        const campaign = await campaignsRepo.findByYandexId(classification.campaign);
-        if (campaign) {
-          const weekAgo = formatDate(getDaysAgo(7));
-          const today = formatDate(new Date());
-          const stats = await dailyStatsRepo.findByCampaignDateRange(campaign.id, weekAgo, today);
+      // 3. Check if clarification is needed
+      if (detectedContext.needsClarification) {
+        logger.info('Context clarification needed', { detectedContext });
 
-          campaignData = [
-            {
-              campaignId: campaign.yandex_id,
-              campaignName: campaign.name,
-              stats: stats.map((s) => ({
-                date: formatDate(s.stat_date),
-                impressions: s.impressions,
-                clicks: s.clicks,
-                cost: Number(s.cost),
-                conversions: s.conversions,
-                ctr: Number(s.ctr) || 0,
-                cpa: s.cpa ? Number(s.cpa) : undefined,
-              })),
-            },
-          ];
-        }
-      } else {
-        // Get all campaigns data
-        const campaigns = await campaignsRepo.getActiveCampaigns();
-        const weekAgo = formatDate(getDaysAgo(7));
-        const today = formatDate(new Date());
-
-        for (const campaign of campaigns) {
-          const stats = await dailyStatsRepo.findByCampaignDateRange(campaign.id, weekAgo, today);
-
-          campaignData.push({
-            campaignId: campaign.yandex_id,
-            campaignName: campaign.name,
-            stats: stats.map((s) => ({
-              date: formatDate(s.stat_date),
-              impressions: s.impressions,
-              clicks: s.clicks,
-              cost: Number(s.cost),
-              conversions: s.conversions,
-              ctr: Number(s.ctr) || 0,
-              cpa: s.cpa ? Number(s.cpa) : undefined,
-            })),
-          });
-        }
+        return {
+          needsClarification: true,
+          message: 'Уточните, о какой кампании или предложении идёт речь:',
+          campaigns: detectedContext.suggestedCampaigns,
+          proposals: detectedContext.suggestedProposals,
+        };
       }
 
-      // 3. Get answer from AI
-      const response = await this.ai.answerQuestion(question, campaignData, {});
+      // 4. Build full context
+      const builtContext = await this.context.buildContextForQuestion(userId, detectedContext);
+
+      // 4. Get or create conversation
+      const conversation = await this.context.getOrCreateConversation(
+        builtContext.campaignContext ? 'campaign_analysis' : 'general',
+        builtContext.campaignContext?.campaignId
+      );
+
+      // 5. Save user message
+      await this.context.addMessage(conversation.id, 'user', question);
+
+      // 6. Get relevant campaign data
+      const campaignData = await this.prepareContextData(builtContext, classification.campaign);
+
+      // 7. Build AI context from built context
+      const aiContext: AnalysisContext = {
+        goals: builtContext.globalContext.goals,
+        knowledgeBase: builtContext.globalContext.knowledgeBase.map((f) => f.fact),
+        campaignHistory: builtContext.campaignContext?.history,
+        previousRecommendations: builtContext.campaignContext?.previousRecommendations,
+        conversationHistory: builtContext.conversationHistory.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+      };
+
+      // 8. Get answer from AI
+      const response = await this.ai.answerQuestion(question, campaignData, aiContext);
+
+      // 9. Save assistant response
+      await this.context.addMessage(conversation.id, 'assistant', response.answer);
+
+      // 10. Update session with current conversation
+      await this.context.updateSession(userId, {
+        currentConversationId: conversation.id,
+      });
 
       return response.answer;
     } catch (error) {
@@ -283,13 +302,84 @@ export class Orchestrator {
 
   /**
    * Get campaigns list
+   * @param filter - 'active' for active only, 'all' for all campaigns (default: 'all')
    */
-  async getCampaigns(): Promise<{ id: string; name: string }[]> {
-    const campaigns = await campaignsRepo.findAll();
+  async getCampaigns(
+    filter: 'active' | 'all' = 'all'
+  ): Promise<{ id: string; name: string; status?: string }[]> {
+    const campaigns =
+      filter === 'active'
+        ? await campaignsRepo.getActiveCampaigns()
+        : await campaignsRepo.findAll();
     return campaigns.map((c) => ({
       id: c.yandex_id,
       name: c.name,
+      status: c.status,
     }));
+  }
+
+  /**
+   * Get proposals list
+   */
+  async getProposals(): Promise<{ id: string; title: string; status: string }[]> {
+    return this.context.getActiveProposals();
+  }
+
+  /**
+   * Set current campaign for user
+   */
+  async setCurrentCampaign(userId: string, campaignId: string): Promise<void> {
+    await this.context.setCurrentCampaign(userId, campaignId);
+  }
+
+  /**
+   * Set current proposal for user
+   */
+  async setCurrentProposal(userId: string, proposalId: string): Promise<void> {
+    await this.context.setCurrentProposal(userId, proposalId);
+  }
+
+  /**
+   * Clear current context for user
+   */
+  async clearCurrentContext(userId: string): Promise<void> {
+    await this.context.clearCurrentContext(userId);
+  }
+
+  /**
+   * Get current context for user
+   */
+  async getCurrentContext(userId: string): Promise<{
+    campaign?: { id: string; name: string };
+    proposal?: { id: string; title: string };
+  }> {
+    const session = await this.context.getSession(userId);
+    const result: {
+      campaign?: { id: string; name: string };
+      proposal?: { id: string; title: string };
+    } = {};
+
+    if (session.currentCampaignId) {
+      const campaignContext = await this.context.getCampaignContext(session.currentCampaignId);
+      if (campaignContext) {
+        result.campaign = {
+          id: campaignContext.campaignId,
+          name: campaignContext.campaignName,
+        };
+      }
+    }
+
+    if (session.currentProposalId) {
+      const proposalContext = await this.context.getProposalContext(session.currentProposalId);
+      if (proposalContext) {
+        result.proposal = {
+          id: proposalContext.proposalId,
+          title: proposalContext.title,
+        };
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -340,7 +430,14 @@ export class Orchestrator {
    */
   private async prepareCampaignData(
     currentStats: CampaignStats[],
-    previousStats: { campaign_id: string; impressions: number; clicks: number; cost: number; conversions: number; ctr: number | null }[]
+    previousStats: {
+      campaign_id: string;
+      impressions: number;
+      clicks: number;
+      cost: number;
+      conversions: number;
+      ctr: number | null;
+    }[]
   ): Promise<CampaignData[]> {
     // Group stats by campaign
     const campaignMap = new Map<string, CampaignStats[]>();
@@ -394,13 +491,95 @@ export class Orchestrator {
                 cost: prevTotals.cost,
                 conversions: prevTotals.conversions,
                 ctr: prevTotals.ctr,
-                cpa: prevTotals.conversions > 0 ? prevTotals.cost / prevTotals.conversions : undefined,
+                cpa:
+                  prevTotals.conversions > 0 ? prevTotals.cost / prevTotals.conversions : undefined,
               }
             : undefined,
       });
     }
 
     return result;
+  }
+
+  /**
+   * Prepare campaign data for user question context
+   */
+  private async prepareContextData(
+    builtContext: BuiltContext,
+    classificationCampaign?: string
+  ): Promise<CampaignData[]> {
+    const campaignData: CampaignData[] = [];
+
+    if (builtContext.campaignContext) {
+      // Get specific campaign data
+      const campaign = await campaignsRepo.findByYandexId(builtContext.campaignContext.campaignId);
+      if (campaign) {
+        const weekAgo = formatDate(getDaysAgo(7));
+        const today = formatDate(new Date());
+        const stats = await dailyStatsRepo.findByCampaignDateRange(campaign.id, weekAgo, today);
+
+        campaignData.push({
+          campaignId: campaign.yandex_id,
+          campaignName: campaign.name,
+          stats: stats.map((s) => ({
+            date: formatDate(s.stat_date),
+            impressions: s.impressions,
+            clicks: s.clicks,
+            cost: Number(s.cost),
+            conversions: s.conversions,
+            ctr: Number(s.ctr) || 0,
+            cpa: s.cpa ? Number(s.cpa) : undefined,
+          })),
+        });
+      }
+    } else if (classificationCampaign) {
+      // Try to find campaign from classification
+      const campaign = await campaignsRepo.findByYandexId(classificationCampaign);
+      if (campaign) {
+        const weekAgo = formatDate(getDaysAgo(7));
+        const today = formatDate(new Date());
+        const stats = await dailyStatsRepo.findByCampaignDateRange(campaign.id, weekAgo, today);
+
+        campaignData.push({
+          campaignId: campaign.yandex_id,
+          campaignName: campaign.name,
+          stats: stats.map((s) => ({
+            date: formatDate(s.stat_date),
+            impressions: s.impressions,
+            clicks: s.clicks,
+            cost: Number(s.cost),
+            conversions: s.conversions,
+            ctr: Number(s.ctr) || 0,
+            cpa: s.cpa ? Number(s.cpa) : undefined,
+          })),
+        });
+      }
+    } else {
+      // Get all campaigns data
+      const campaigns = await campaignsRepo.getActiveCampaigns();
+      const weekAgo = formatDate(getDaysAgo(7));
+      const today = formatDate(new Date());
+
+      for (const campaign of campaigns) {
+        const stats = await dailyStatsRepo.findByCampaignDateRange(campaign.id, weekAgo, today);
+
+        campaignData.push({
+          campaignId: campaign.yandex_id,
+          campaignName: campaign.name,
+          stats: stats.map((s) => ({
+            date: formatDate(s.stat_date),
+            impressions: s.impressions,
+            clicks: s.clicks,
+            cost: Number(s.cost),
+            conversions: s.conversions,
+            ctr: Number(s.ctr) || 0,
+            cpa: s.cpa ? Number(s.cpa) : undefined,
+          })),
+        });
+      }
+    }
+
+    return campaignData;
   }
 
   /**

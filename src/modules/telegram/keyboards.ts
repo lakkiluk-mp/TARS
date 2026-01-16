@@ -130,6 +130,98 @@ export function createContextKeyboard(
 }
 
 /**
+ * Create inline keyboard for campaign clarification
+ */
+export function createCampaignClarificationKeyboard(
+  campaigns: { id: string; name: string }[]
+): InlineKeyboardMarkup {
+  const buttons: InlineKeyboardButton[][] = campaigns.map((c) => [
+    { text: c.name, callback_data: `set_campaign:${c.id}` },
+  ]);
+
+  buttons.push([{ text: '❌ Отмена', callback_data: 'cancel_clarification' }]);
+
+  return {
+    inline_keyboard: buttons,
+  };
+}
+
+/**
+ * Create inline keyboard for proposal clarification
+ */
+export function createProposalClarificationKeyboard(
+  proposals: { id: string; title: string }[]
+): InlineKeyboardMarkup {
+  const buttons: InlineKeyboardButton[][] = proposals.map((p) => [
+    { text: p.title, callback_data: `set_proposal:${p.id}` },
+  ]);
+
+  buttons.push([{ text: '❌ Отмена', callback_data: 'cancel_clarification' }]);
+
+  return {
+    inline_keyboard: buttons,
+  };
+}
+
+/**
+ * Create inline keyboard for proposal selection
+ */
+export function createProposalKeyboard(
+  proposals: { id: string; title: string; status: string }[]
+): InlineKeyboardMarkup {
+  const statusEmoji: Record<string, string> = {
+    draft: '📝',
+    discussing: '💬',
+    approved: '✅',
+    implemented: '🚀',
+  };
+
+  const buttons: InlineKeyboardButton[][] = proposals.map((p) => [
+    {
+      text: `${statusEmoji[p.status] || '📋'} ${p.title}`,
+      callback_data: `proposal:${p.id}`,
+    },
+  ]);
+
+  buttons.push([{ text: '🔙 Назад', callback_data: 'back' }]);
+
+  return {
+    inline_keyboard: buttons,
+  };
+}
+
+/**
+ * Create inline keyboard for current context display
+ */
+export function createCurrentContextKeyboard(
+  currentCampaign?: { id: string; name: string },
+  currentProposal?: { id: string; title: string }
+): InlineKeyboardMarkup {
+  const buttons: InlineKeyboardButton[][] = [];
+
+  if (currentCampaign) {
+    buttons.push([
+      { text: `🎯 ${currentCampaign.name}`, callback_data: `campaign:${currentCampaign.id}` },
+    ]);
+  }
+
+  if (currentProposal) {
+    buttons.push([
+      { text: `💡 ${currentProposal.title}`, callback_data: `proposal:${currentProposal.id}` },
+    ]);
+  }
+
+  buttons.push([
+    { text: '🔄 Сменить контекст', callback_data: 'menu:campaigns' },
+    { text: '🌐 Сбросить', callback_data: 'clear_context' },
+  ]);
+
+  return {
+    inline_keyboard: buttons,
+  };
+}
+
+/**
  * Remove inline keyboard
  */
 export function removeKeyboard(): { remove_keyboard: true } {
@@ -144,5 +236,9 @@ export default {
   createMainMenuKeyboard,
   createSettingsKeyboard,
   createContextKeyboard,
+  createCampaignClarificationKeyboard,
+  createProposalClarificationKeyboard,
+  createProposalKeyboard,
+  createCurrentContextKeyboard,
   removeKeyboard,
 };

@@ -1,0 +1,50 @@
+services:
+  app:
+    build: .
+    container_name: tars-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./src:/app/src:ro
+    develop:
+      watch:
+        - action: rebuild
+          path: ./src
+          target: /app/src
+        - action: rebuild
+          path: ./package.json
+    networks:
+      - tars-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: tars-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-tars}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-tars_password}
+      POSTGRES_DB: ${DB_NAME:-tars}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/database/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - tars-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-tars} -d ${DB_NAME:-tars}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+
+networks:
+  tars-network:
+    driver: bridge

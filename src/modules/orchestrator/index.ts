@@ -9,15 +9,26 @@ import { query } from '../../database/client';
 
 const logger = createModuleLogger('orchestrator');
 
+const MIN_QUERY_COST = 50; // Minimum cost to consider a query significant
+const MIN_QUERY_CLICKS = 2; // Minimum clicks to consider a query significant
+const MAX_QUERIES_FOR_AI = 10; // Limit queries sent to AI to save tokens
+
 export interface OrchestratorConfig {
   debugMode?: boolean;
 }
+
+import { ActionManager } from '../actions/manager';
+import { ActionType } from '../actions/types';
+import { actionsRepo } from '../../database/repositories';
+
+// ... existing imports ...
 
 export class Orchestrator {
   private yandex: YandexDirectClient;
   private ai: AIEngine;
   private telegram: TelegramBot;
   private context: ContextManager;
+  private actionManager: ActionManager; // New
   private config: OrchestratorConfig;
 
   constructor(
@@ -32,6 +43,7 @@ export class Orchestrator {
     this.telegram = telegram;
     this.context = context;
     this.config = config;
+    this.actionManager = new ActionManager(yandex); // Initialize
 
     // Set orchestrator in telegram handlers
     telegram.setOrchestrator(this);
@@ -58,6 +70,27 @@ export class Orchestrator {
       // 4. Prepare data for AI
       const campaignData = await this.prepareCampaignData(stats, previousStats);
 
+      // Enhance with search queries for better context (Negative Keywords)
+      for (const campaign of campaignData) {
+        try {
+          // Get queries for the last 3 days to spot trends
+          const queries = await this.yandex.getSearchQueries(
+            campaign.campaignId,
+            formatDate(getDaysAgo(3)),
+            formatDate(getYesterday())
+          );
+
+          // Filter high cost queries (e.g. > 50 rub) or high clicks (> 2)
+          // This is a naive filter, AI will do the real filtering
+          campaign.searchQueries = queries
+            .filter((q) => q.cost > MIN_QUERY_COST || q.clicks > MIN_QUERY_CLICKS)
+            .sort((a, b) => b.cost - a.cost)
+            .slice(0, MAX_QUERIES_FOR_AI); // Limit to top 10 to save tokens
+        } catch (e) {
+          logger.warn(`Failed to fetch queries for campaign ${campaign.campaignId}`, { error: e });
+        }
+      }
+
       // 5. Get analysis from AI
       const analysis = await this.ai.analyze({
         data: campaignData,
@@ -67,12 +100,40 @@ export class Orchestrator {
         task: 'daily_report',
       });
 
-      // 6. Format and send report
+      // 6. Propose actions from AI recommendations
+      for (const rec of analysis.recommendations) {
+        if (rec.action) {
+          // Map AI action type to internal ActionType
+          // AI types: update_bid, add_negative_keyword, suspend_campaign, resume_campaign
+          // Internal ActionTypes match these strings mostly, but let's be safe
+          if (Object.values(ActionType).includes(rec.action.type as ActionType)) {
+            await this.proposeAction(
+              rec.action.campaignId || campaignData[0]?.campaignId || '', // Fallback to first campaign if not specified
+              rec.action.type as ActionType,
+              rec.action.params,
+              rec.reasoning
+            );
+          }
+        }
+      }
+
+      // 7. Format and send report
       const reportText = this.formatDailyReport(analysis, stats);
 
       await this.telegram.sendReport(
         reportText,
-        analysis.recommendations as { id: string; title: string; description: string }[]
+        // Only send recommendations that DON'T have direct actions attached
+        // (because actions are sent as separate confirmation cards)
+        // OR send all, but maybe modify the report format.
+        // For now, let's send text recommendations as list in the report,
+        // and actions as separate cards via proposeAction above.
+        analysis.recommendations
+          .filter((r) => !r.action)
+          .map((r) => ({
+            id: r.id,
+            title: r.title,
+            description: r.description,
+          }))
       );
 
       logger.info('Daily report generated and sent');
@@ -287,17 +348,77 @@ export class Orchestrator {
   }
 
   /**
+   * Create and propose an action
+   */
+  async proposeAction(
+    campaignId: string,
+    type: ActionType,
+    data: any,
+    reasoning: string
+  ): Promise<void> {
+    // 1. Create pending action
+    const action = await this.actionManager.createAction(campaignId, type, data, reasoning);
+
+    // 2. Format message
+    const message =
+      `⚠️ *Требуется действие*\n\n` +
+      `📌 *Кампания:* ${campaignId}\n` + // Better to show name, but ID is faster for now
+      `🔧 *Действие:* ${this.formatActionType(type)}\n` +
+      `📝 *Детали:* ${JSON.stringify(data)}\n\n` +
+      `🤖 *Причина:* ${reasoning}`;
+
+    // 3. Send to Telegram
+    // Assuming we send to admin. Ideally we should know which user context triggered this.
+    // For MVP, sending to admin ID from config (telegram module handles this via ID)
+    // But orchestrator doesn't know admin ID directly.
+    // We'll trust telegram bot to send to configured admin.
+    const chatId = process.env.TELEGRAM_ADMIN_ID;
+    if (chatId) {
+      const messageId = await this.telegram.sendActionConfirmation(chatId, action.id, message);
+
+      // Update action with message ID for future reference
+      await actionsRepo.updateMessageId(action.id, messageId);
+    } else {
+      logger.warn('No admin ID found to send action confirmation');
+    }
+  }
+
+  private formatActionType(type: string): string {
+    switch (type) {
+      case ActionType.UPDATE_BID:
+        return 'Изменение ставки';
+      case ActionType.ADD_NEGATIVE_KEYWORD:
+        return 'Добавление минус-слов';
+      case ActionType.SUSPEND_CAMPAIGN:
+        return 'Остановка кампании';
+      case ActionType.RESUME_CAMPAIGN:
+        return 'Запуск кампании';
+      default:
+        return type;
+    }
+  }
+
+  /**
    * Execute approved action
    */
   async executeAction(actionId: string): Promise<void> {
     logger.info('Executing action', { actionId });
 
-    // TODO: Implement action execution
-    // 1. Get action from database
-    // 2. Execute via Yandex API
-    // 3. Log result
+    try {
+      await this.actionManager.executeAction(actionId);
+      logger.info('Action executed', { actionId });
+    } catch (error) {
+      logger.error('Failed to execute action', { actionId, error });
+      throw error;
+    }
+  }
 
-    logger.info('Action executed', { actionId });
+  /**
+   * Reject action
+   */
+  async rejectAction(actionId: string): Promise<void> {
+    logger.info('Rejecting action', { actionId });
+    await this.actionManager.rejectAction(actionId);
   }
 
   /**

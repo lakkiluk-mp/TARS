@@ -74,7 +74,9 @@ export class TelegramBot {
     this.bot.use(async (ctx, next) => {
       if (!isAuthorized(ctx, this.config.adminId)) {
         logger.warn('Unauthorized access attempt', { userId: ctx.from?.id });
-        await ctx.reply('⛔ Доступ запрещён. Этот бот работает только для авторизованных пользователей.');
+        await ctx.reply(
+          '⛔ Доступ запрещён. Этот бот работает только для авторизованных пользователей.'
+        );
         return;
       }
       return next();
@@ -270,7 +272,10 @@ export class TelegramBot {
   /**
    * Send message to admin
    */
-  async sendToAdmin(message: string, options?: { parse_mode?: 'Markdown' | 'HTML' }): Promise<void> {
+  async sendToAdmin(
+    message: string,
+    options?: { parse_mode?: 'Markdown' | 'HTML' }
+  ): Promise<void> {
     try {
       await this.bot.telegram.sendMessage(this.config.adminId, message, options);
     } catch (error) {
@@ -308,6 +313,23 @@ export class TelegramBot {
    */
   getBotInstance(): Telegraf<BotContext> {
     return this.bot;
+  }
+  /**
+   * Send action confirmation request
+   */
+  async sendActionConfirmation(
+    chatId: number | string,
+    actionId: string,
+    text: string
+  ): Promise<number> {
+    const { createConfirmKeyboard } = await import('./keyboards');
+
+    const message = await this.bot.telegram.sendMessage(chatId, text, {
+      parse_mode: 'Markdown',
+      reply_markup: createConfirmKeyboard(actionId),
+    });
+
+    return message.message_id;
   }
 }
 

@@ -14,6 +14,10 @@ export interface DailyStat {
   conversions: number;
   cpa: number | null;
   ctr: number | null;
+  revenue: number;
+  roi: number | null;
+  profit: number | null;
+  conversion_value: number | null;
   raw_json: Record<string, unknown> | null;
   created_at: Date;
 }
@@ -27,6 +31,10 @@ export interface CreateDailyStatInput {
   conversions: number;
   cpa?: number;
   ctr?: number;
+  revenue?: number;
+  roi?: number;
+  profit?: number;
+  conversion_value?: number;
   raw_json?: Record<string, unknown>;
 }
 
@@ -56,10 +64,7 @@ export async function findByCampaignDateRange(
   return result.rows;
 }
 
-export async function findAllByDateRange(
-  dateFrom: string,
-  dateTo: string
-): Promise<DailyStat[]> {
+export async function findAllByDateRange(dateFrom: string, dateTo: string): Promise<DailyStat[]> {
   const result = await query<DailyStat>(
     `SELECT * FROM daily_stats 
      WHERE stat_date BETWEEN $1 AND $2
@@ -74,10 +79,18 @@ export async function upsert(input: CreateDailyStatInput): Promise<DailyStat> {
   const ctr = input.ctr ?? (input.impressions > 0 ? (input.clicks / input.impressions) * 100 : 0);
   // Calculate CPA if not provided
   const cpa = input.cpa ?? (input.conversions > 0 ? input.cost / input.conversions : null);
+  // Calculate ROI if not provided (Revenue - Cost) / Cost * 100
+  const roi =
+    input.roi ??
+    (input.cost > 0 && input.revenue !== undefined
+      ? ((input.revenue - input.cost) / input.cost) * 100
+      : null);
+  // Calculate Profit if not provided (Revenue - Cost)
+  const profit = input.profit ?? (input.revenue !== undefined ? input.revenue - input.cost : null);
 
   const result = await query<DailyStat>(
-    `INSERT INTO daily_stats (campaign_id, stat_date, impressions, clicks, cost, conversions, cpa, ctr, raw_json)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO daily_stats (campaign_id, stat_date, impressions, clicks, cost, conversions, cpa, ctr, revenue, roi, profit, conversion_value, raw_json)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (campaign_id, stat_date) DO UPDATE SET
        impressions = EXCLUDED.impressions,
        clicks = EXCLUDED.clicks,
@@ -85,6 +98,10 @@ export async function upsert(input: CreateDailyStatInput): Promise<DailyStat> {
        conversions = EXCLUDED.conversions,
        cpa = EXCLUDED.cpa,
        ctr = EXCLUDED.ctr,
+       revenue = EXCLUDED.revenue,
+       roi = EXCLUDED.roi,
+       profit = EXCLUDED.profit,
+       conversion_value = EXCLUDED.conversion_value,
        raw_json = EXCLUDED.raw_json
      RETURNING *`,
     [
@@ -96,6 +113,10 @@ export async function upsert(input: CreateDailyStatInput): Promise<DailyStat> {
       input.conversions,
       cpa,
       ctr,
+      input.revenue || 0,
+      roi,
+      profit,
+      input.conversion_value || null,
       input.raw_json ? JSON.stringify(input.raw_json) : null,
     ]
   );

@@ -38,6 +38,7 @@ export interface Orchestrator {
   getProposals(): Promise<{ id: string; title: string; status: string }[]>;
   handleUserQuestion(question: string, userId: string): Promise<string | ClarificationResponse>;
   executeAction(actionId: string): Promise<void>;
+  rejectAction(actionId: string): Promise<void>; // New
   getAIUsageStats(): string;
   setCurrentCampaign(userId: string, campaignId: string): Promise<void>;
   setCurrentProposal(userId: string, proposalId: string): Promise<void>;
@@ -158,7 +159,11 @@ export async function handleReport(ctx: BotContext): Promise<void> {
     await ctx.reply(report.text, { parse_mode: 'Markdown' });
 
     // Send recommendations with action buttons
-    for (const rec of report.recommendations as { id: string; title: string; description: string }[]) {
+    for (const rec of report.recommendations as {
+      id: string;
+      title: string;
+      description: string;
+    }[]) {
       await ctx.reply(`💡 *${rec.title}*\n\n${rec.description}`, {
         parse_mode: 'Markdown',
         reply_markup: createRecommendationKeyboard(rec.id),
@@ -271,9 +276,12 @@ export async function handleCampaignSwitch(ctx: BotContext, campaignId: string):
 
   try {
     await orchestrator.setCurrentCampaign(userId, campaignId);
-    await ctx.reply(`✅ Контекст переключён на кампанию *${campaignId}*\n\nТеперь все вопросы будут относиться к этой кампании.`, {
-      parse_mode: 'Markdown',
-    });
+    await ctx.reply(
+      `✅ Контекст переключён на кампанию *${campaignId}*\n\nТеперь все вопросы будут относиться к этой кампании.`,
+      {
+        parse_mode: 'Markdown',
+      }
+    );
   } catch (error) {
     logger.error('Failed to switch campaign', { error });
     await ctx.reply('❌ Не удалось переключить контекст. Проверьте ID кампании.');
@@ -301,9 +309,12 @@ export async function handleProposalSwitch(ctx: BotContext, proposalId: string):
 
   try {
     await orchestrator.setCurrentProposal(userId, proposalId);
-    await ctx.reply(`✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`, {
-      parse_mode: 'Markdown',
-    });
+    await ctx.reply(
+      `✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`,
+      {
+        parse_mode: 'Markdown',
+      }
+    );
   } catch (error) {
     logger.error('Failed to switch proposal', { error });
     await ctx.reply('❌ Не удалось переключить контекст. Проверьте ID предложения.');
@@ -367,9 +378,12 @@ export async function handleClearContext(ctx: BotContext): Promise<void> {
 
   try {
     await orchestrator.clearCurrentContext(userId);
-    await ctx.reply('✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.', {
-      parse_mode: 'Markdown',
-    });
+    await ctx.reply(
+      '✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.',
+      {
+        parse_mode: 'Markdown',
+      }
+    );
   } catch (error) {
     logger.error('Failed to clear context', { error });
     await ctx.reply('❌ Не удалось сбросить контекст');
@@ -397,7 +411,7 @@ export async function handleAsk(ctx: BotContext, question: string): Promise<void
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
     const result = await orchestrator.handleUserQuestion(question, userId);
-    
+
     // Check if clarification is needed
     if (typeof result === 'object' && result.needsClarification) {
       // Show clarification keyboard
@@ -412,7 +426,9 @@ export async function handleAsk(ctx: BotContext, question: string): Promise<void
           reply_markup: createProposalClarificationKeyboard(result.proposals),
         });
       } else {
-        await ctx.reply('❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.');
+        await ctx.reply(
+          '❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.'
+        );
       }
     } else {
       // Normal answer
@@ -443,7 +459,7 @@ export async function handleMessage(ctx: BotContext): Promise<void> {
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
     const result = await orchestrator.handleUserQuestion(text, userId);
-    
+
     // Check if clarification is needed
     if (typeof result === 'object' && result.needsClarification) {
       // Show clarification keyboard
@@ -458,7 +474,9 @@ export async function handleMessage(ctx: BotContext): Promise<void> {
           reply_markup: createProposalClarificationKeyboard(result.proposals),
         });
       } else {
-        await ctx.reply('❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.');
+        await ctx.reply(
+          '❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.'
+        );
       }
     } else {
       // Normal answer
@@ -493,6 +511,17 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
   try {
     switch (action) {
       case 'approve':
+        // Old recommendation flow used approve:actionId.
+        // New action flow uses confirm:actionId from createConfirmKeyboard
+        // We should handle both or unify. createRecommendationKeyboard uses 'approve'/'reject'.
+        // Let's assume 'approve' is for Recommendations (which might eventually trigger actions)
+        // For now, let's treat approve as executeAction
+        await ctx.answerCbQuery('Выполняю...');
+        await orchestrator.executeAction(param);
+        await ctx.editMessageText('✅ Действие выполнено!');
+        break;
+
+      case 'confirm': // New flow
         await ctx.answerCbQuery('Выполняю...');
         await orchestrator.executeAction(param);
         await ctx.editMessageText('✅ Действие выполнено!');
@@ -500,7 +529,15 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
 
       case 'reject':
         await ctx.answerCbQuery('Отклонено');
+        // If it's a real action, reject it in DB
+        await orchestrator.rejectAction(param);
         await ctx.editMessageText('❌ Действие отклонено');
+        break;
+
+      case 'cancel': // New flow cancel
+        await ctx.answerCbQuery('Отменено');
+        await orchestrator.rejectAction(param);
+        await ctx.editMessageText('❌ Действие отменено');
         break;
 
       case 'explain':
@@ -614,14 +651,20 @@ export async function handleUsageStats(ctx: BotContext): Promise<void> {
 /**
  * Handle campaign selection callback - switch context to campaign
  */
-async function handleCampaignCallback(ctx: BotContext, campaignId: string, userId: string): Promise<void> {
+async function handleCampaignCallback(
+  ctx: BotContext,
+  campaignId: string,
+  userId: string
+): Promise<void> {
   await ctx.answerCbQuery('Переключаю контекст...');
 
   if (!orchestrator) return;
 
   try {
     await orchestrator.setCurrentCampaign(userId, campaignId);
-    await ctx.editMessageText(`✅ Контекст переключён на кампанию\n\nТеперь все вопросы будут относиться к этой кампании.`);
+    await ctx.editMessageText(
+      `✅ Контекст переключён на кампанию\n\nТеперь все вопросы будут относиться к этой кампании.`
+    );
   } catch (error) {
     logger.error('Failed to switch campaign context', { error });
     await ctx.reply('❌ Не удалось переключить контекст');
@@ -631,14 +674,20 @@ async function handleCampaignCallback(ctx: BotContext, campaignId: string, userI
 /**
  * Handle proposal selection callback - switch context to proposal
  */
-async function handleProposalCallback(ctx: BotContext, proposalId: string, userId: string): Promise<void> {
+async function handleProposalCallback(
+  ctx: BotContext,
+  proposalId: string,
+  userId: string
+): Promise<void> {
   await ctx.answerCbQuery('Переключаю контекст...');
 
   if (!orchestrator) return;
 
   try {
     await orchestrator.setCurrentProposal(userId, proposalId);
-    await ctx.editMessageText(`✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`);
+    await ctx.editMessageText(
+      `✅ Контекст переключён на предложение\n\nТеперь все вопросы будут относиться к этому предложению.`
+    );
   } catch (error) {
     logger.error('Failed to switch proposal context', { error });
     await ctx.reply('❌ Не удалось переключить контекст');
@@ -648,7 +697,11 @@ async function handleProposalCallback(ctx: BotContext, proposalId: string, userI
 /**
  * Handle set campaign callback from clarification keyboard
  */
-async function handleSetCampaignCallback(ctx: BotContext, campaignId: string, userId: string): Promise<void> {
+async function handleSetCampaignCallback(
+  ctx: BotContext,
+  campaignId: string,
+  userId: string
+): Promise<void> {
   await ctx.answerCbQuery('Выбрано');
 
   if (!orchestrator) return;
@@ -665,7 +718,11 @@ async function handleSetCampaignCallback(ctx: BotContext, campaignId: string, us
 /**
  * Handle set proposal callback from clarification keyboard
  */
-async function handleSetProposalCallback(ctx: BotContext, proposalId: string, userId: string): Promise<void> {
+async function handleSetProposalCallback(
+  ctx: BotContext,
+  proposalId: string,
+  userId: string
+): Promise<void> {
   await ctx.answerCbQuery('Выбрано');
 
   if (!orchestrator) return;
@@ -689,7 +746,9 @@ async function handleClearContextCallback(ctx: BotContext, userId: string): Prom
 
   try {
     await orchestrator.clearCurrentContext(userId);
-    await ctx.editMessageText(`✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.`);
+    await ctx.editMessageText(
+      `✅ Контекст сброшен\n\nТеперь вопросы будут анализироваться в общем контексте.`
+    );
   } catch (error) {
     logger.error('Failed to clear context', { error });
     await ctx.reply('❌ Не удалось сбросить контекст');

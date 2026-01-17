@@ -30,6 +30,15 @@ export interface SessionContext {
   lastActivity: Date;
 }
 
+export interface UserSession {
+  id: string;
+  telegram_user_id: string;
+  current_conversation_id: string | null;
+  current_campaign_id: string | null;
+  settings: Record<string, unknown>;
+  updated_at: Date;
+}
+
 export interface ContextDetectionResult {
   campaignId?: string;
   campaignName?: string;

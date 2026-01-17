@@ -39,6 +39,7 @@ export interface Orchestrator {
   handleUserQuestion(question: string, userId: string): Promise<string | ClarificationResponse>;
   executeAction(actionId: string): Promise<void>;
   rejectAction(actionId: string): Promise<void>; // New
+  explainAction(actionId: string): Promise<string>; // New
   getAIUsageStats(): string;
   setCurrentCampaign(userId: string, campaignId: string): Promise<void>;
   setCurrentProposal(userId: string, proposalId: string): Promise<void>;
@@ -541,9 +542,19 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
         break;
 
       case 'explain':
-        await ctx.answerCbQuery();
-        // TODO: Get explanation from AI
-        await ctx.reply('💬 Объяснение будет добавлено в следующей версии');
+        await ctx.answerCbQuery('Загружаю объяснение...');
+
+        if (orchestrator) {
+          try {
+            const explanation = await orchestrator.explainAction(param);
+            await ctx.reply(`📝 *Объяснение действия:*\n\n${explanation}`, {
+              parse_mode: 'Markdown',
+            });
+          } catch (error) {
+            logger.error('Failed to explain action', { error });
+            await ctx.reply('❌ Не удалось получить объяснение');
+          }
+        }
         break;
 
       case 'modify':

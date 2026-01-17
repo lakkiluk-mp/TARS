@@ -242,10 +242,21 @@ export class Orchestrator {
       const campaigns = await this.yandex.getCampaigns('all');
 
       for (const campaign of campaigns) {
+        // Extract relevant settings to store in JSONB
+        const settings: Record<string, any> = {
+          StartDate: campaign.StartDate,
+          EndDate: campaign.EndDate,
+          DailyBudget: campaign.DailyBudget,
+          Type: campaign.Type,
+          // Store TextCampaign settings (Strategy, Goals, etc.) if available
+          TextCampaign: campaign.TextCampaign,
+        };
+
         await campaignsRepo.upsertFromYandex(
           campaign.Id.toString(),
           campaign.Name,
-          campaign.Status
+          campaign.Status,
+          settings
         );
       }
 
@@ -393,6 +404,22 @@ export class Orchestrator {
         return 'Остановка кампании';
       case ActionType.RESUME_CAMPAIGN:
         return 'Запуск кампании';
+      case ActionType.UPDATE_DAILY_BUDGET:
+        return 'Изменение дневного бюджета';
+      case ActionType.UPDATE_WEEKLY_BUDGET:
+        return 'Изменение недельного бюджета';
+      case ActionType.UPDATE_AD:
+        return 'Изменение объявления';
+      case ActionType.SUSPEND_AD:
+        return 'Остановка объявления';
+      case ActionType.RESUME_AD:
+        return 'Запуск объявления';
+      case ActionType.ARCHIVE_AD:
+        return 'Архивация объявления';
+      case ActionType.UPDATE_SCHEDULE:
+        return 'Изменение расписания показов';
+      case ActionType.UPDATE_BID_MODIFIER:
+        return 'Изменение корректировок ставок (пол/возраст/устройства)';
       default:
         return type;
     }
@@ -422,6 +449,18 @@ export class Orchestrator {
   }
 
   /**
+   * Explain action
+   */
+  async explainAction(actionId: string): Promise<string> {
+    logger.info('Explaining action', { actionId });
+    const action = await actionsRepo.findById(actionId);
+    if (!action) {
+      return 'Действие не найдено или уже удалено.';
+    }
+    return action.ai_reasoning || 'К сожалению, объяснение для этого действия отсутствует.';
+  }
+
+  /**
    * Get campaigns list
    * @param filter - 'active' for active only, 'all' for all campaigns (default: 'all')
    */
@@ -447,9 +486,18 @@ export class Orchestrator {
   }
 
   /**
+   * Clear current context for user
+   */
+  async clearCurrentContext(userId: string): Promise<void> {
+    await this.archiveCurrentConversation(userId);
+    await this.context.clearCurrentContext(userId);
+  }
+
+  /**
    * Set current campaign for user
    */
   async setCurrentCampaign(userId: string, campaignId: string): Promise<void> {
+    await this.archiveCurrentConversation(userId);
     await this.context.setCurrentCampaign(userId, campaignId);
   }
 
@@ -457,14 +505,50 @@ export class Orchestrator {
    * Set current proposal for user
    */
   async setCurrentProposal(userId: string, proposalId: string): Promise<void> {
+    await this.archiveCurrentConversation(userId);
     await this.context.setCurrentProposal(userId, proposalId);
   }
 
   /**
-   * Clear current context for user
+   * Archive and summarize current conversation if needed
    */
-  async clearCurrentContext(userId: string): Promise<void> {
-    await this.context.clearCurrentContext(userId);
+  private async archiveCurrentConversation(userId: string): Promise<void> {
+    try {
+      const session = await this.context.getSession(userId);
+      if (!session.currentConversationId) return;
+
+      const messages = await this.context.getConversationMessages(session.currentConversationId);
+
+      // Don't summarize empty or very short conversations
+      if (messages.length < 2) return;
+
+      logger.info('Archiving and summarizing conversation', {
+        conversationId: session.currentConversationId,
+        messageCount: messages.length,
+      });
+
+      const summary = await this.ai.summarizeConversation(
+        messages.map((m) => ({ role: m.role, content: m.content }))
+      );
+
+      // Save summary
+      await this.context.finalizeConversation(session.currentConversationId, summary.summary);
+
+      // Save extracted knowledge facts
+      if (summary.keyFacts && summary.keyFacts.length > 0) {
+        for (const fact of summary.keyFacts) {
+          await this.context.addKnowledge(
+            fact,
+            `conversation/${session.currentConversationId}`,
+            session.currentCampaignId
+          );
+        }
+        logger.info(`Extracted ${summary.keyFacts.length} facts from conversation`);
+      }
+    } catch (error) {
+      logger.error('Failed to archive conversation', { error, userId });
+      // Don't block the flow if summarization fails
+    }
   }
 
   /**

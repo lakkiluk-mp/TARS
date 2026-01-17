@@ -93,17 +93,29 @@ export async function update(id: string, input: UpdateCampaignInput): Promise<Ca
 export async function upsertFromYandex(
   yandexId: string,
   name: string,
-  status: string
+  status: string,
+  settings?: Record<string, unknown>
 ): Promise<Campaign> {
-  const result = await query<Campaign>(
-    `INSERT INTO campaigns (yandex_id, name, status)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (yandex_id) DO UPDATE SET
-       name = EXCLUDED.name,
-       status = EXCLUDED.status
-     RETURNING *`,
-    [yandexId, name, status]
-  );
+  const queryText = settings
+    ? `INSERT INTO campaigns (yandex_id, name, status, settings)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (yandex_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         status = EXCLUDED.status,
+         settings = EXCLUDED.settings
+       RETURNING *`
+    : `INSERT INTO campaigns (yandex_id, name, status)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (yandex_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         status = EXCLUDED.status
+       RETURNING *`;
+
+  const params = settings
+    ? [yandexId, name, status, JSON.stringify(settings)]
+    : [yandexId, name, status];
+
+  const result = await query<Campaign>(queryText, params);
 
   return result.rows[0];
 }

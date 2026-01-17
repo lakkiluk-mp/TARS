@@ -40,8 +40,18 @@ export class ContextManager {
       createdAt: row.created_at,
     }));
 
+    // Get business goals from knowledge base
+    const goalsResult = await query<{ fact: string }>(
+      "SELECT fact FROM knowledge_base WHERE source LIKE 'initial_context/%goals%' LIMIT 1"
+    );
+
+    const goals =
+      goalsResult.rows.length > 0
+        ? goalsResult.rows[0].fact
+        : 'Максимизация конверсий при оптимальном CPA';
+
     return {
-      goals: 'Максимизация конверсий при оптимальном CPA', // TODO: Make configurable
+      goals,
       knowledgeBase,
       bestPractices: [
         'Регулярно добавлять минус-слова',

@@ -6,7 +6,7 @@ import { initDatabase, checkConnection, closeDatabase } from './database/client'
 import { YandexDirectClient } from './modules/yandex';
 import { AIEngine } from './modules/ai';
 import { TelegramBot } from './modules/telegram';
-import { ContextManager } from './modules/context';
+import { ContextManager, ContextLoader } from './modules/context';
 import { Orchestrator } from './modules/orchestrator';
 import { initScheduler, startScheduler, stopScheduler } from './modules/scheduler';
 
@@ -79,6 +79,24 @@ async function main() {
     logger.info('Initializing Context Manager...');
     const contextManager = new ContextManager();
     logger.info('✅ Context Manager initialized');
+
+    // Load initial context from files
+    try {
+      logger.info('Loading initial context from files...');
+      const contextLoader = new ContextLoader();
+      const loadResult = await contextLoader.loadAllContext();
+      logger.info('✅ Initial context loaded', {
+        loaded: loadResult.loaded,
+        skipped: loadResult.skipped,
+        errors: loadResult.errors.length,
+      });
+      if (loadResult.errors.length > 0) {
+        logger.warn('Some context files failed to load', { errors: loadResult.errors });
+      }
+    } catch (error) {
+      logger.error('Failed to load initial context', { error });
+      // Continue even if context loading fails
+    }
 
     // 7. Initialize Orchestrator
     logger.info('Initializing Orchestrator...');

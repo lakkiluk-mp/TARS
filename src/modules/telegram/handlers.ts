@@ -423,6 +423,7 @@ export async function handleAsk(ctx: BotContext, question: string): Promise<void
 
     if (ctx.chat?.id) {
       await messagesQueue.add('user_question', {
+        type: 'user_question',
         chatId: ctx.chat.id,
         userId,
         question,
@@ -453,7 +454,8 @@ export async function handleMessage(ctx: BotContext): Promise<void> {
     const userId = ctx.from?.id?.toString() || 'unknown';
 
     if (ctx.chat?.id) {
-      await messagesQueue.add('user_question', {
+      await messagesQueue.add('user_message', {
+        type: 'user_question', // Use same type for worker logic
         chatId: ctx.chat.id,
         userId,
         question: text,
@@ -923,6 +925,7 @@ export async function handleCreateCampaign(ctx: BotContext, description: string)
 
     if (ctx.chat?.id) {
       await messagesQueue.add('create_campaign', {
+        type: 'create_campaign',
         chatId: ctx.chat.id,
         userId,
         description,

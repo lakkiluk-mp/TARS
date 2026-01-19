@@ -1,9 +1,15 @@
-import { Worker } from 'bullmq';
+import { Worker, Job } from 'bullmq';
 import { redisConfig } from './redis';
-import { QueueName, JobData, GenerateReportJobData, HandleUserQuestionJobData } from './types';
+import { QueueName, GenerateReportJobData, MessageJobData } from './types';
 import { Orchestrator } from '../orchestrator';
 import { TelegramBot } from '../telegram';
 import { createModuleLogger } from '../../utils/logger';
+import {
+  createRecommendationKeyboard,
+  createProposalActionKeyboard,
+  createCampaignClarificationKeyboard,
+  createProposalClarificationKeyboard,
+} from '../telegram/keyboards';
 
 const logger = createModuleLogger('queue-workers');
 
@@ -15,22 +21,12 @@ export const initWorkers = (orchestrator: Orchestrator, telegramBot: TelegramBot
       logger.info('Processing report job', { id: job.id, type: job.data.type });
       try {
         if (job.data.type === 'daily') {
-          // generateDailyReport returns { text: string, recommendations: ... }
-          // We pass sendToTelegram=false because we handle sending here or let orchestrator do it?
-          // Actually, orchestrator.generateDailyReport(true) sends it directly.
-          // But to be safe and consistent, we might want to get result and send manually.
-          // Let's rely on orchestrator for now, or adapt it.
-          // Looking at handlers.ts: orchestrator.generateDailyReport(false) then ctx.reply.
-          // So we should do the same.
-
           const report = await orchestrator.generateDailyReport(false);
           await telegramBot.sendMessage(job.data.chatId, report.text, { parse_mode: 'Markdown' });
 
           // Send recommendations
           if (report.recommendations && report.recommendations.length > 0) {
-            const { createRecommendationKeyboard } = await import('../telegram/keyboards');
-
-            for (const rec of report.recommendations as any[]) {
+            for (const rec of report.recommendations) {
               await telegramBot.sendMessage(
                 job.data.chatId,
                 `💡 *${rec.title}*\n\n${rec.description}`,
@@ -55,22 +51,21 @@ export const initWorkers = (orchestrator: Orchestrator, telegramBot: TelegramBot
   );
 
   // Worker for Messages and Campaigns
-  new Worker<HandleUserQuestionJobData | any>( // TODO: Fix typing
+  new Worker<MessageJobData>(
     QueueName.MESSAGES,
-    async (job) => {
+    async (job: Job<MessageJobData>) => {
       logger.info('Processing message job', { id: job.id, type: job.name });
 
       try {
         if (job.name === 'create_campaign') {
-          const data = job.data as any; // Cast for now
+          // Type guard check (runtime check + casting if needed, but discrimination works better)
+          // Since job.name is passed when adding job, we trust it matches the data structure for now
+          // But TypeScript doesn't know relationship between job.name and job.data type automatically in generic Worker
+          // So we cast to specific type
+          const data = job.data as Extract<MessageJobData, { type: 'create_campaign' }>;
+
           // generateCampaignProposal logic
           const result = await orchestrator.generateCampaignProposal(data.description, data.userId);
-          // We need to send the result back.
-          // Looking at handlers.ts: it sends a structured message and keyboard.
-          // We need access to 'createProposalActionKeyboard'.
-
-          // Dynamic import to avoid circular dependency if possible, or assume it's available
-          const { createProposalActionKeyboard } = await import('../telegram/keyboards');
 
           const content = result.content;
           let message = `✅ *Предложение создано: ${result.title}*\n\n`;
@@ -89,15 +84,11 @@ export const initWorkers = (orchestrator: Orchestrator, telegramBot: TelegramBot
             parse_mode: 'Markdown',
             reply_markup: createProposalActionKeyboard(result.proposalId),
           });
-        } else {
-          // Standard question handling
-          const data = job.data as HandleUserQuestionJobData;
+        } else if (job.name === 'user_question' || job.name === 'user_message') {
+          const data = job.data as Extract<MessageJobData, { type: 'user_question' }>;
           const result = await orchestrator.handleUserQuestion(data.question, data.userId);
 
           if (typeof result === 'object' && result.needsClarification) {
-            const { createCampaignClarificationKeyboard, createProposalClarificationKeyboard } =
-              await import('../telegram/keyboards');
-
             if (result.campaigns && result.campaigns.length > 0) {
               await telegramBot.sendMessage(data.chatId, result.message, {
                 parse_mode: 'Markdown',

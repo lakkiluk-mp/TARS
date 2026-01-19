@@ -4,6 +4,7 @@ export interface GenerateReportJobData {
 }
 
 export interface HandleUserQuestionJobData {
+  type: 'user_question'; // Discriminated union member
   chatId: number;
   userId: string;
   question: string;
@@ -15,16 +16,13 @@ export interface SyncDataJobData {
 }
 
 export interface CreateCampaignJobData {
+  type: 'create_campaign'; // Discriminated union member
   chatId: number;
   userId: string;
   description: string;
 }
 
-export type JobData =
-  | GenerateReportJobData
-  | HandleUserQuestionJobData
-  | SyncDataJobData
-  | CreateCampaignJobData;
+export type MessageJobData = HandleUserQuestionJobData | CreateCampaignJobData;
 
 export enum QueueName {
   REPORTS = 'reports',

@@ -324,6 +324,29 @@ export class TelegramBot {
   }
 
   /**
+   * Send text message to user
+   */
+  async sendMessage(
+    chatId: number | string,
+    text: string,
+    options?: any // Type 'any' for flexibility with Telegraf options
+  ): Promise<void> {
+    try {
+      await this.bot.telegram.sendMessage(chatId, text, options);
+    } catch (error) {
+      logger.error('Failed to send message', { error, chatId });
+      // Retry without options (e.g. without Markdown) if that was the cause
+      if (options?.parse_mode) {
+        try {
+          await this.bot.telegram.sendMessage(chatId, text);
+        } catch (retryError) {
+          logger.error('Failed to send message on retry', { error: retryError });
+        }
+      }
+    }
+  }
+
+  /**
    * Get bot instance (for advanced usage)
    */
   getBotInstance(): Telegraf<BotContext> {

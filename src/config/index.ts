@@ -15,6 +15,13 @@ const configSchema = z.object({
     name: z.string().default('tars'),
   }),
 
+  // Redis
+  redis: z.object({
+    host: z.string().default('localhost'),
+    port: z.coerce.number().default(6379),
+    password: z.string().optional(),
+  }),
+
   // Yandex Direct
   yandex: z.object({
     clientId: z.string(),
@@ -63,6 +70,11 @@ function loadConfig() {
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
       name: process.env.DB_NAME,
+    },
+    redis: {
+      host: process.env.REDIS_HOST,
+      port: process.env.REDIS_PORT,
+      password: process.env.REDIS_PASSWORD,
     },
     yandex: {
       clientId: process.env.YANDEX_CLIENT_ID,

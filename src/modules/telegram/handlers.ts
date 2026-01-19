@@ -11,6 +11,7 @@ import {
   createCurrentContextKeyboard,
 } from './keyboards';
 import { ContextLoader } from '../context';
+import { reportsQueue, messagesQueue } from '../queue';
 
 const logger = createModuleLogger('telegram-handlers');
 
@@ -163,27 +164,19 @@ export async function handleReport(ctx: BotContext): Promise<void> {
 
   logger.info('Report command received', { userId: ctx.from?.id });
 
-  await ctx.reply('⏳ Генерирую отчёт за вчера...');
-
   try {
-    const report = await orchestrator.generateDailyReport(false); // Don't send duplicate
-
-    await ctx.reply(report.text, { parse_mode: 'Markdown' });
-
-    // Send recommendations with action buttons
-    for (const rec of report.recommendations as {
-      id: string;
-      title: string;
-      description: string;
-    }[]) {
-      await ctx.reply(`💡 *${rec.title}*\n\n${rec.description}`, {
-        parse_mode: 'Markdown',
-        reply_markup: createRecommendationKeyboard(rec.id),
+    if (ctx.chat?.id) {
+      await reportsQueue.add('daily_report', {
+        chatId: ctx.chat.id,
+        type: 'daily',
       });
+      await ctx.reply('⏳ Запрос добавлен в очередь. Я пришлю отчёт, как только он будет готов.');
+    } else {
+      await ctx.reply('❌ Не удалось определить ID чата.');
     }
   } catch (error) {
-    logger.error('Failed to generate report', { error });
-    await ctx.reply('❌ Не удалось сгенерировать отчёт. Попробуйте позже.');
+    logger.error('Failed to queue report', { error });
+    await ctx.reply('❌ Не удалось добавить запрос в очередь.');
   }
 }
 
@@ -198,14 +191,21 @@ export async function handleWeekReport(ctx: BotContext): Promise<void> {
 
   logger.info('Week report command received', { userId: ctx.from?.id });
 
-  await ctx.reply('⏳ Генерирую недельный отчёт...');
-
   try {
-    const report = await orchestrator.generateWeeklyReport(false); // Don't send duplicate
-    await ctx.reply(report.text, { parse_mode: 'Markdown' });
+    if (ctx.chat?.id) {
+      await reportsQueue.add('weekly_report', {
+        chatId: ctx.chat.id,
+        type: 'weekly',
+      });
+      await ctx.reply(
+        '⏳ Запрос на недельный отчёт добавлен в очередь. Это может занять некоторое время.'
+      );
+    } else {
+      await ctx.reply('❌ Не удалось определить ID чата.');
+    }
   } catch (error) {
-    logger.error('Failed to generate weekly report', { error });
-    await ctx.reply('❌ Не удалось сгенерировать отчёт. Попробуйте позже.');
+    logger.error('Failed to queue weekly report', { error });
+    await ctx.reply('❌ Не удалось добавить запрос в очередь.');
   }
 }
 
@@ -418,37 +418,20 @@ export async function handleAsk(ctx: BotContext, question: string): Promise<void
 
   logger.info('Ask command received', { userId: ctx.from?.id, question });
 
-  await ctx.reply('🤔 Думаю...');
-
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
-    const result = await orchestrator.handleUserQuestion(question, userId);
 
-    // Check if clarification is needed
-    if (typeof result === 'object' && result.needsClarification) {
-      // Show clarification keyboard
-      if (result.campaigns && result.campaigns.length > 0) {
-        await ctx.reply(result.message, {
-          parse_mode: 'Markdown',
-          reply_markup: createCampaignClarificationKeyboard(result.campaigns),
-        });
-      } else if (result.proposals && result.proposals.length > 0) {
-        await ctx.reply(result.message, {
-          parse_mode: 'Markdown',
-          reply_markup: createProposalClarificationKeyboard(result.proposals),
-        });
-      } else {
-        await ctx.reply(
-          '❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.'
-        );
-      }
-    } else {
-      // Normal answer
-      await ctx.reply(result as string, { parse_mode: 'Markdown' });
+    if (ctx.chat?.id) {
+      await messagesQueue.add('user_question', {
+        chatId: ctx.chat.id,
+        userId,
+        question,
+      });
+      await ctx.reply('⏳ Думаю...');
     }
   } catch (error) {
-    logger.error('Failed to answer question', { error });
-    await ctx.reply('❌ Не удалось обработать вопрос. Попробуйте переформулировать.');
+    logger.error('Failed to queue question', { error });
+    await ctx.reply('❌ Не удалось обработать вопрос.');
   }
 }
 
@@ -466,37 +449,20 @@ export async function handleMessage(ctx: BotContext): Promise<void> {
 
   logger.info('Message received', { userId: ctx.from?.id, text: text.substring(0, 50) });
 
-  await ctx.reply('🤔 Думаю...');
-
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
-    const result = await orchestrator.handleUserQuestion(text, userId);
 
-    // Check if clarification is needed
-    if (typeof result === 'object' && result.needsClarification) {
-      // Show clarification keyboard
-      if (result.campaigns && result.campaigns.length > 0) {
-        await ctx.reply(result.message, {
-          parse_mode: 'Markdown',
-          reply_markup: createCampaignClarificationKeyboard(result.campaigns),
-        });
-      } else if (result.proposals && result.proposals.length > 0) {
-        await ctx.reply(result.message, {
-          parse_mode: 'Markdown',
-          reply_markup: createProposalClarificationKeyboard(result.proposals),
-        });
-      } else {
-        await ctx.reply(
-          '❓ Не удалось определить контекст. Используйте /campaign или /proposal для выбора.'
-        );
-      }
-    } else {
-      // Normal answer
-      await ctx.reply(result as string, { parse_mode: 'Markdown' });
+    if (ctx.chat?.id) {
+      await messagesQueue.add('user_question', {
+        chatId: ctx.chat.id,
+        userId,
+        question: text,
+      });
+      await ctx.reply('⏳ Думаю...');
     }
   } catch (error) {
-    logger.error('Failed to handle message', { error });
-    await ctx.reply('❌ Не удалось обработать сообщение. Попробуйте ещё раз.');
+    logger.error('Failed to queue message', { error });
+    await ctx.reply('❌ Не удалось обработать сообщение.');
   }
 }
 
@@ -952,32 +918,20 @@ export async function handleCreateCampaign(ctx: BotContext, description: string)
 
   logger.info('Create campaign command received', { userId: ctx.from?.id, description });
 
-  await ctx.reply('🤔 Анализирую запрос и генерирую предложение...');
-
   try {
     const userId = ctx.from?.id?.toString() || 'unknown';
-    const result = await orchestrator.generateCampaignProposal(description, userId);
 
-    const content = result.content;
-    let message = `✅ *Предложение создано: ${result.title}*\n\n`;
-    message += `📝 *Описание:* ${content.description}\n\n`;
-    message += `🎯 *Стратегия:* ${content.campaignStructure?.strategy?.name || 'N/A'}\n`;
-    message += `💰 *Бюджет:* ${content.campaignStructure?.strategy?.budget || 'N/A'}\n\n`;
-    message += `📊 *Прогноз:* Клики: ${content.estimatedResults?.clicks}, CPA: ${content.estimatedResults?.cpa}\n\n`;
-
-    if (content.questions && content.questions.length > 0) {
-      message += `❓ *Вопросы:*\n${content.questions.map((q: string) => `• ${q}`).join('\n')}\n\n`;
+    if (ctx.chat?.id) {
+      await messagesQueue.add('create_campaign', {
+        chatId: ctx.chat.id,
+        userId,
+        description,
+      });
+      await ctx.reply('🤔 Анализирую запрос и генерирую предложение...');
     }
-
-    message += `Контекст переключён на это предложение. Вы можете обсуждать его и вносить правки.`;
-
-    await ctx.reply(message, {
-      parse_mode: 'Markdown',
-      reply_markup: createProposalActionKeyboard(result.proposalId),
-    });
   } catch (error) {
-    logger.error('Failed to create campaign proposal', { error });
-    await ctx.reply('❌ Не удалось создать предложение. Попробуйте позже.');
+    logger.error('Failed to queue create campaign', { error });
+    await ctx.reply('❌ Не удалось создать запрос.');
   }
 }
 

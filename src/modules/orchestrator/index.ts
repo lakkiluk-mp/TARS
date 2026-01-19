@@ -24,6 +24,7 @@ const logger = createModuleLogger('orchestrator');
 const MIN_QUERY_COST = 50; // Minimum cost to consider a query significant
 const MIN_QUERY_CLICKS = 2; // Minimum clicks to consider a query significant
 const MAX_QUERIES_FOR_AI = 10; // Limit queries sent to AI to save tokens
+const ACTION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours action validity
 
 export interface OrchestratorConfig {
   debugMode?: boolean;
@@ -699,6 +700,21 @@ export class Orchestrator {
     try {
       // Get action details before execution for logging
       const action = await actionsRepo.findById(actionId);
+
+      if (!action) {
+        throw new Error(`Action ${actionId} not found`);
+      }
+
+      // Check for expiration
+      const now = new Date();
+      const createdAt = new Date(action.created_at);
+      if (now.getTime() - createdAt.getTime() > ACTION_TTL_MS) {
+        logger.warn('Attempt to execute expired action', { actionId, createdAt });
+        await this.rejectAction(actionId); // Mark as rejected/expired
+        throw new Error(
+          'Срок действия этого предложения истёк (24 часа). Сгенерируйте новый отчёт.'
+        );
+      }
 
       await this.actionManager.executeAction(actionId);
       logger.info('Action executed', { actionId });

@@ -8,6 +8,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./logs:/app/logs
       - ./src:/app/src:ro
@@ -33,17 +35,34 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./src/database/migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5437:5432"
+      - '5437:5432'
     networks:
       - tars-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-tars} -d ${DB_NAME:-tars}"]
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-tars} -d ${DB_NAME:-tars}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tars-redis
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    networks:
+      - tars-network
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
   postgres_data:
+  redis_data:
 
 networks:
   tars-network:

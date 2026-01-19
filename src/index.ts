@@ -8,6 +8,7 @@ import { AIEngine } from './modules/ai';
 import { TelegramBot } from './modules/telegram';
 import { ContextManager, ContextLoader } from './modules/context';
 import { Orchestrator } from './modules/orchestrator';
+import { initWorkers } from './modules/queue';
 import { initScheduler, startScheduler, stopScheduler } from './modules/scheduler';
 
 // Main entry point
@@ -104,6 +105,11 @@ async function main() {
       debugMode: config.debug,
     });
     logger.info('✅ Orchestrator initialized');
+
+    // 7.5. Initialize Queue Workers
+    logger.info('Initializing Queue Workers...');
+    initWorkers(orchestrator, telegramBot);
+    logger.info('✅ Queue Workers initialized');
 
     // 8. Initialize Scheduler
     logger.info('Initializing Scheduler...');

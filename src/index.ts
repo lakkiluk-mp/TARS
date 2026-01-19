@@ -79,6 +79,8 @@ async function main() {
     // 6. Initialize Context Manager
     logger.info('Initializing Context Manager...');
     const contextManager = new ContextManager();
+    // Inject AI Engine for vector search
+    contextManager.setAIEngine(aiEngine);
     logger.info('✅ Context Manager initialized');
 
     // Load initial context from files

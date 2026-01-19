@@ -1,5 +1,6 @@
 import { query } from '../../database/client';
 import { createModuleLogger } from '../../utils/logger';
+import { AIEngine } from '../ai/engine';
 import {
   GlobalContext,
   CampaignContext,
@@ -15,6 +16,15 @@ import {
 const logger = createModuleLogger('context-manager');
 
 export class ContextManager {
+  private ai?: AIEngine;
+
+  /**
+   * Set AI Engine for embeddings
+   */
+  setAIEngine(ai: AIEngine): void {
+    this.ai = ai;
+  }
+
   /**
    * Get global context (goals, knowledge base, best practices)
    */
@@ -272,11 +282,28 @@ export class ContextManager {
   ): Promise<void> {
     logger.info('Adding knowledge fact', { fact: fact.substring(0, 50), source });
 
-    await query(
-      `INSERT INTO knowledge_base (fact, source, confidence, related_campaign_id)
-       VALUES ($1, $2, $3, $4)`,
-      [fact, source, confidence, relatedCampaignId || null]
-    );
+    let embedding: number[] | null = null;
+    if (this.ai) {
+      try {
+        embedding = await this.ai.getEmbeddings(fact);
+      } catch (e) {
+        logger.warn('Failed to generate embedding for knowledge fact', { error: e });
+      }
+    }
+
+    if (embedding) {
+      await query(
+        `INSERT INTO knowledge_base (fact, source, confidence, related_campaign_id, embedding)
+           VALUES ($1, $2, $3, $4, $5)`,
+        [fact, source, confidence, relatedCampaignId || null, JSON.stringify(embedding)]
+      );
+    } else {
+      await query(
+        `INSERT INTO knowledge_base (fact, source, confidence, related_campaign_id)
+           VALUES ($1, $2, $3, $4)`,
+        [fact, source, confidence, relatedCampaignId || null]
+      );
+    }
   }
 
   /**
@@ -436,7 +463,43 @@ export class ContextManager {
   async searchKnowledge(searchQuery: string, limit = 10): Promise<KnowledgeFact[]> {
     logger.debug('Searching knowledge', { query: searchQuery });
 
-    // Simple text search (can be enhanced with pgvector later)
+    // Try semantic search if AI is available
+    if (this.ai) {
+      try {
+        const embedding = await this.ai.getEmbeddings(searchQuery);
+        if (embedding && embedding.length > 0) {
+          const vectorStr = JSON.stringify(embedding);
+          const result = await query<{
+            id: string;
+            fact: string;
+            source: string;
+            confidence: number;
+            related_campaign_id: string | null;
+            created_at: Date;
+            distance: number;
+          }>(
+            `SELECT *, embedding <=> $1 as distance 
+                   FROM knowledge_base 
+                   ORDER BY distance ASC 
+                   LIMIT $2`,
+            [vectorStr, limit]
+          );
+
+          return result.rows.map((row) => ({
+            id: row.id,
+            fact: row.fact,
+            source: row.source,
+            confidence: row.confidence,
+            relatedCampaignId: row.related_campaign_id || undefined,
+            createdAt: row.created_at,
+          }));
+        }
+      } catch (e) {
+        logger.warn('Semantic search failed, falling back to text search', { error: e });
+      }
+    }
+
+    // Fallback to simple text search
     const result = await query<{
       id: string;
       fact: string;

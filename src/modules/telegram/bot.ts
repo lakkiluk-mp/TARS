@@ -23,6 +23,7 @@ import {
   handleListContext,
   handleClearKnowledge,
   handleSync,
+  handleCreateCampaign,
 } from './handlers';
 
 const logger = createModuleLogger('telegram-bot');
@@ -147,6 +148,12 @@ export class TelegramBot {
       await handleSync(ctx, mode || undefined);
     });
 
+    this.bot.command('create_campaign', async (ctx) => {
+      const text = ctx.message.text;
+      const description = text.replace(/^\/create_campaign\s*/, '').trim();
+      await handleCreateCampaign(ctx, description);
+    });
+
     this.bot.command('analyze', async (ctx) => {
       const text = ctx.message.text;
       const campaignName = text.replace(/^\/analyze\s*/, '').trim();
@@ -235,6 +242,7 @@ export class TelegramBot {
         { command: 'week', description: '📈 Отчёт за неделю' },
         { command: 'campaigns', description: '📋 Список кампаний' },
         { command: 'proposals', description: '💡 Список предложений' },
+        { command: 'create_campaign', description: '✨ Создать кампанию' },
         { command: 'context', description: '📍 Текущий контекст' },
         { command: 'clear', description: '🔄 Сбросить контекст' },
         { command: 'ask', description: '❓ Задать вопрос AI' },
@@ -279,7 +287,14 @@ export class TelegramBot {
     try {
       await this.bot.telegram.sendMessage(this.config.adminId, message, options);
     } catch (error) {
-      logger.error('Failed to send message to admin', { error });
+      logger.warn('Failed to send message to admin with options, retrying as plain text', {
+        error,
+      });
+      try {
+        await this.bot.telegram.sendMessage(this.config.adminId, message);
+      } catch (retryError) {
+        logger.error('Failed to send message to admin even as plain text', { error: retryError });
+      }
     }
   }
 
@@ -324,12 +339,25 @@ export class TelegramBot {
   ): Promise<number> {
     const { createConfirmKeyboard } = await import('./keyboards');
 
-    const message = await this.bot.telegram.sendMessage(chatId, text, {
-      parse_mode: 'Markdown',
-      reply_markup: createConfirmKeyboard(actionId),
-    });
+    // Use default text message without parse_mode first to avoid errors,
+    // then if we trust the source we can use Markdown.
+    // Given the issues with Markdown parsing, let's try to send with Markdown but catch errors.
 
-    return message.message_id;
+    try {
+      const message = await this.bot.telegram.sendMessage(chatId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: createConfirmKeyboard(actionId),
+      });
+      return message.message_id;
+    } catch (e) {
+      logger.warn('Failed to send action with Markdown, falling back to plain text', { error: e });
+      // Fallback to plain text if Markdown fails (stripping symbols might be hard, so just send as is or try HTML)
+      // Better: send as plain text
+      const message = await this.bot.telegram.sendMessage(chatId, text, {
+        reply_markup: createConfirmKeyboard(actionId),
+      });
+      return message.message_id;
+    }
   }
 }
 

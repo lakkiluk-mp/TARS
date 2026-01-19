@@ -1,10 +1,22 @@
 import { createModuleLogger } from '../../utils/logger';
-import { formatDate, getYesterday, getDaysAgo, getWeekStart } from '../../utils/helpers';
+import {
+  formatDate,
+  getYesterday,
+  getDaysAgo,
+  getWeekStart,
+  escapeMarkdown,
+} from '../../utils/helpers';
 import { YandexDirectClient, CampaignStats } from '../yandex';
 import { AIEngine, AnalysisResponse, CampaignData, Recommendation, AnalysisContext } from '../ai';
 import { TelegramBot } from '../telegram';
-import { ContextManager, BuiltContext } from '../context';
-import { campaignsRepo, dailyStatsRepo } from '../../database/repositories';
+import { ContextManager, BuiltContext, ContextLoader } from '../context';
+import {
+  campaignsRepo,
+  dailyStatsRepo,
+  proposalsRepo,
+  keywordsRepo,
+  searchQueriesRepo,
+} from '../../database/repositories';
 import { query } from '../../database/client';
 
 const logger = createModuleLogger('orchestrator');
@@ -51,8 +63,11 @@ export class Orchestrator {
 
   /**
    * Generate daily report
+   * @param sendToTelegram - Whether to send the report to Telegram immediately (default: true)
    */
-  async generateDailyReport(): Promise<{ text: string; recommendations: Recommendation[] }> {
+  async generateDailyReport(
+    sendToTelegram = true
+  ): Promise<{ text: string; recommendations: Recommendation[] }> {
     logger.info('Generating daily report...');
 
     try {
@@ -80,14 +95,95 @@ export class Orchestrator {
             formatDate(getYesterday())
           );
 
-          // Filter high cost queries (e.g. > 50 rub) or high clicks (> 2)
-          // This is a naive filter, AI will do the real filtering
+          // Save queries to DB
+          const dbCampaign = await campaignsRepo.findByYandexId(campaign.campaignId);
+          if (dbCampaign) {
+            for (const q of queries) {
+              await searchQueriesRepo.upsert({
+                campaign_id: dbCampaign.id,
+                query: q.query,
+                impressions: q.impressions,
+                clicks: q.clicks,
+                cost: q.cost,
+                query_date: q.date,
+              });
+            }
+          }
+
+          // Process queries for AI analysis
+          // 1. Top Performing (Conversions > 0, sorted by Conversions desc, then Cost desc)
+          // Since getSearchQueries from client might not return conversions yet (needs update in client.ts if report supports it),
+          // we might rely on clicks/ctr for now if conversions are missing in report fields.
+          // Let's check YandexDirectClient.getSearchQueries.
+          // It fetches 'Query', 'CampaignId', 'Impressions', 'Clicks', 'Cost', 'Date'.
+          // We need to add 'Conversions' to the report request in YandexDirectClient!
+
+          // Assuming we update client to fetch Conversions, or we use Clicks as proxy for now.
+          // Let's update client first (next step).
+
           campaign.searchQueries = queries
             .filter((q) => q.cost > MIN_QUERY_COST || q.clicks > MIN_QUERY_CLICKS)
             .sort((a, b) => b.cost - a.cost)
-            .slice(0, MAX_QUERIES_FOR_AI); // Limit to top 10 to save tokens
+            .slice(0, MAX_QUERIES_FOR_AI);
+
+          // Identify wasteful queries (High Cost, 0 Conversions - using Clicks/Cost as proxy if conv missing)
+          // "Wasteful" = Cost > 200 RUB (example) and Clicks > 5.
+          campaign.wastefulQueries = queries
+            .filter((q) => q.cost > 100 && (!q.conversions || q.conversions === 0))
+            .sort((a, b) => b.cost - a.cost)
+            .slice(0, 5)
+            .map((q) => ({
+              query: q.query,
+              clicks: q.clicks,
+              cost: q.cost,
+            }));
+
+          // Identify top performing (High Clicks/CTR)
+          campaign.topPerformingQueries = queries
+            .filter((q) => q.clicks > 0)
+            .sort((a, b) => b.clicks - a.clicks)
+            .slice(0, 5)
+            .map((q) => ({
+              query: q.query,
+              clicks: q.clicks,
+              cost: q.cost,
+              conversions: q.conversions || 0,
+              cpa: q.conversions && q.conversions > 0 ? q.cost / q.conversions : 0,
+            }));
         } catch (e) {
           logger.warn(`Failed to fetch queries for campaign ${campaign.campaignId}`, { error: e });
+        }
+
+        // Add campaign settings if we can find them in DB
+        const dbCampaign = await campaignsRepo.findByYandexId(campaign.campaignId);
+        if (dbCampaign && dbCampaign.settings) {
+          const settings = dbCampaign.settings as any;
+          // Extract strategy and budget
+          let strategy = 'Unknown';
+          let budget = 0;
+          let budgetMode = 'Unknown';
+
+          if (settings.TextCampaign && settings.TextCampaign.BiddingStrategy) {
+            const bs = settings.TextCampaign.BiddingStrategy;
+            strategy =
+              bs.Search?.BiddingStrategyType || bs.Network?.BiddingStrategyType || 'Unknown';
+          }
+
+          if (settings.DailyBudget) {
+            budget = settings.DailyBudget.Amount ? settings.DailyBudget.Amount / 1000000 : 0;
+            budgetMode = settings.DailyBudget.Mode;
+          }
+
+          const bidModifiers = settings.BidModifiers || [];
+          const timeTargeting = settings.TimeTargeting;
+
+          campaign.settings = {
+            strategy,
+            budget,
+            budgetMode,
+            bidModifiers, // Now we have them
+            timeTargeting, // Now we have them
+          };
         }
       }
 
@@ -100,19 +196,33 @@ export class Orchestrator {
         task: 'daily_report',
       });
 
-      // 6. Propose actions from AI recommendations
-      for (const rec of analysis.recommendations) {
-        if (rec.action) {
-          // Map AI action type to internal ActionType
-          // AI types: update_bid, add_negative_keyword, suspend_campaign, resume_campaign
-          // Internal ActionTypes match these strings mostly, but let's be safe
-          if (Object.values(ActionType).includes(rec.action.type as ActionType)) {
-            await this.proposeAction(
-              rec.action.campaignId || campaignData[0]?.campaignId || '', // Fallback to first campaign if not specified
-              rec.action.type as ActionType,
-              rec.action.params,
-              rec.reasoning
+      // 6. Propose actions from AI recommendations (Only if sending to Telegram automatically)
+      if (sendToTelegram) {
+        for (const rec of analysis.recommendations) {
+          if (rec.action) {
+            const campaignIds = (rec.action.campaignId || campaignData[0]?.campaignId || '').split(
+              ','
             );
+
+            for (const campaignId of campaignIds) {
+              const trimmedId = campaignId.trim();
+              if (!trimmedId) continue;
+
+              if (Object.values(ActionType).includes(rec.action.type as ActionType)) {
+                // Find internal campaign ID (UUID) from Yandex ID
+                const dbCampaign = await campaignsRepo.findByYandexId(trimmedId);
+                if (dbCampaign) {
+                  await this.proposeAction(
+                    dbCampaign.id, // Use UUID
+                    rec.action.type as ActionType,
+                    rec.action.params,
+                    rec.reasoning
+                  );
+                } else {
+                  logger.warn(`Campaign not found for action: ${trimmedId}`);
+                }
+              }
+            }
           }
         }
       }
@@ -120,23 +230,26 @@ export class Orchestrator {
       // 7. Format and send report
       const reportText = this.formatDailyReport(analysis, stats);
 
-      await this.telegram.sendReport(
-        reportText,
-        // Only send recommendations that DON'T have direct actions attached
-        // (because actions are sent as separate confirmation cards)
-        // OR send all, but maybe modify the report format.
-        // For now, let's send text recommendations as list in the report,
-        // and actions as separate cards via proposeAction above.
-        analysis.recommendations
-          .filter((r) => !r.action)
-          .map((r) => ({
-            id: r.id,
-            title: r.title,
-            description: r.description,
-          }))
-      );
-
-      logger.info('Daily report generated and sent');
+      if (sendToTelegram) {
+        await this.telegram.sendReport(
+          reportText,
+          // Only send recommendations that DON'T have direct actions attached
+          // (because actions are sent as separate confirmation cards)
+          // OR send all, but maybe modify the report format.
+          // For now, let's send text recommendations as list in the report,
+          // and actions as separate cards via proposeAction above.
+          analysis.recommendations
+            .filter((r) => !r.action)
+            .map((r) => ({
+              id: r.id,
+              title: r.title,
+              description: r.description,
+            }))
+        );
+        logger.info('Daily report generated and sent');
+      } else {
+        logger.info('Daily report generated (not sent)');
+      }
 
       return {
         text: reportText,
@@ -150,8 +263,11 @@ export class Orchestrator {
 
   /**
    * Generate weekly report
+   * @param sendToTelegram - Whether to send the report to Telegram immediately (default: true)
    */
-  async generateWeeklyReport(): Promise<{ text: string; recommendations: Recommendation[] }> {
+  async generateWeeklyReport(
+    sendToTelegram = true
+  ): Promise<{ text: string; recommendations: Recommendation[] }> {
     logger.info('Generating weekly report...');
 
     try {
@@ -180,12 +296,19 @@ export class Orchestrator {
         task: 'weekly_report',
       });
 
+      // Save weekly learning to file
+      const loader = new ContextLoader();
+      await loader.saveLearning(analysis.text, 'weekly');
+
       // 6. Format and send
       const reportText = this.formatWeeklyReport(analysis, stats);
 
-      await this.telegram.sendReport(reportText);
-
-      logger.info('Weekly report generated and sent');
+      if (sendToTelegram) {
+        await this.telegram.sendReport(reportText);
+        logger.info('Weekly report generated and sent');
+      } else {
+        logger.info('Weekly report generated (not sent)');
+      }
 
       return {
         text: reportText,
@@ -248,9 +371,18 @@ export class Orchestrator {
           EndDate: campaign.EndDate,
           DailyBudget: campaign.DailyBudget,
           Type: campaign.Type,
+          TimeTargeting: campaign.TimeTargeting, // Added TimeTargeting
           // Store TextCampaign settings (Strategy, Goals, etc.) if available
           TextCampaign: campaign.TextCampaign,
         };
+
+        // Fetch Bid Modifiers
+        try {
+          const bidModifiers = await this.yandex.getBidModifiers(campaign.Id.toString());
+          settings.BidModifiers = bidModifiers;
+        } catch (e) {
+          logger.warn(`Failed to fetch bid modifiers for campaign ${campaign.Id}`, { error: e });
+        }
 
         await campaignsRepo.upsertFromYandex(
           campaign.Id.toString(),
@@ -258,6 +390,42 @@ export class Orchestrator {
           campaign.Status,
           settings
         );
+
+        // Sync keywords for active campaigns
+        // This makes sure 'keywords' table is populated
+        if (campaign.Status === 'ACCEPTED' || campaign.Status === 'MODERATION') {
+          try {
+            const dbCampaign = await campaignsRepo.findByYandexId(campaign.Id.toString());
+            if (dbCampaign) {
+              const keywords = await this.yandex.getKeywords(campaign.Id.toString());
+              for (const kw of keywords) {
+                await keywordsRepo.upsert({
+                  campaign_id: dbCampaign.id,
+                  keyword: kw.Keyword,
+                  match_type: 'phrase', // Default or parse from keyword text if needed
+                  bid: kw.Bid ? kw.Bid / 1000000 : undefined, // Convert micros if fetched as micros, but getKeywords returns AuctionBids?
+                  // Wait, getKeywords returns Bid in micros?
+                  // YandexDirectClient.getKeywords maps response.
+                  // Let's check YandexDirectClient.getKeywords implementation.
+                  // It returns Fields: Id, Keyword, Bid, ContextBid...
+                  // Bid in API v5 is usually micros.
+                  // But let's check parsing. Client uses `response.data.result`.
+                  // It doesn't transform values. So it is micros.
+                  // Update: YandexKeyword interface says 'Bid: number'.
+                  // Let's assume micros and divide by 1000000.
+                  status: kw.Status,
+                  stats: {
+                    State: kw.State,
+                    ServingStatus: kw.ServingStatus,
+                  },
+                });
+              }
+              logger.info(`Synced ${keywords.length} keywords for campaign ${campaign.Id}`);
+            }
+          } catch (e) {
+            logger.warn(`Failed to sync keywords for campaign ${campaign.Id}`, { error: e });
+          }
+        }
       }
 
       logger.info(`Synced ${campaigns.length} campaigns (all statuses)`);
@@ -359,6 +527,83 @@ export class Orchestrator {
   }
 
   /**
+   * Generate campaign proposal based on user request
+   */
+  async generateCampaignProposal(
+    userRequest: string,
+    userId: string
+  ): Promise<{ proposalId: string; title: string; content: any }> {
+    logger.info('Generating campaign proposal', { userId, request: userRequest.substring(0, 50) });
+
+    try {
+      // 1. Get user session to maintain continuity if needed, but for new proposal we usually start fresh context or use global
+      const session = await this.context.getSession(userId);
+
+      // 2. Get global context (goals, best practices)
+      const globalContext = await this.context.getGlobalContext();
+
+      // 3. Prepare context for AI
+      // We might want to include conversation history if the user was discussing this idea previously
+      let conversationHistory: any[] = [];
+      if (session.currentConversationId) {
+        const msgs = await this.context.getConversationMessages(session.currentConversationId);
+        conversationHistory = msgs.slice(-5); // Last 5 messages for context
+      }
+
+      const aiContext: AnalysisContext = {
+        goals: globalContext.goals,
+        knowledgeBase: globalContext.knowledgeBase.map((f) => f.fact),
+        conversationHistory: conversationHistory.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        // We don't need campaign history for a NEW campaign proposal usually
+      };
+
+      // 4. Generate proposal structure via AI
+      const proposalContent = await this.ai.generateProposal(userRequest, aiContext);
+
+      // 5. Create conversation for this proposal
+      const conversation = await this.context.getOrCreateConversation('proposal');
+
+      // 6. Save proposal to DB
+      const proposal = await proposalsRepo.create({
+        title: proposalContent.title || 'Новая кампания',
+        status: 'draft',
+        instruction_file: JSON.stringify(proposalContent, null, 2),
+        reasoning: proposalContent.reasoning,
+        conversation_id: conversation.id,
+      });
+
+      // 7. Update conversation with proposal ID
+      await query('UPDATE conversations SET proposal_id = $1 WHERE id = $2', [
+        proposal.id,
+        conversation.id,
+      ]);
+
+      // 8. Add initial messages to conversation
+      await this.context.addMessage(conversation.id, 'user', userRequest);
+      await this.context.addMessage(
+        conversation.id,
+        'assistant',
+        `Я подготовил предложение "${proposal.title}".\n\n${proposalContent.description}`
+      );
+
+      // 9. Update user session to focus on this proposal
+      await this.context.setCurrentProposal(userId, proposal.id);
+
+      return {
+        proposalId: proposal.id,
+        title: proposal.title,
+        content: proposalContent,
+      };
+    } catch (error) {
+      logger.error('Failed to generate proposal', { error });
+      throw error;
+    }
+  }
+
+  /**
    * Create and propose an action
    */
   async proposeAction(
@@ -370,12 +615,32 @@ export class Orchestrator {
     // 1. Create pending action
     const action = await this.actionManager.createAction(campaignId, type, data, reasoning);
 
+    // Get campaign name for display
+    let campaignName = campaignId;
+    try {
+      const campaign = await campaignsRepo.findById(campaignId);
+      if (campaign) {
+        campaignName = campaign.name;
+      }
+    } catch (e) {
+      // Ignore
+    }
+
+    // Format data nicely
+    let formattedData = '';
+    if (data.keywords)
+      formattedData += `Ключевые слова: ${Array.isArray(data.keywords) ? data.keywords.join(', ') : data.keywords}\n`;
+    if (data.newBid) formattedData += `Новая ставка: ${data.newBid} ₽\n`;
+    if (data.amount) formattedData += `Сумма: ${data.amount} ₽\n`;
+    if (data.status) formattedData += `Статус: ${data.status}\n`;
+    if (!formattedData) formattedData = JSON.stringify(data);
+
     // 2. Format message
     const message =
       `⚠️ *Требуется действие*\n\n` +
-      `📌 *Кампания:* ${campaignId}\n` + // Better to show name, but ID is faster for now
+      `📌 *Кампания:* ${campaignName}\n` +
       `🔧 *Действие:* ${this.formatActionType(type)}\n` +
-      `📝 *Детали:* ${JSON.stringify(data)}\n\n` +
+      `📝 *Детали:*\n${formattedData}\n` +
       `🤖 *Причина:* ${reasoning}`;
 
     // 3. Send to Telegram
@@ -432,8 +697,20 @@ export class Orchestrator {
     logger.info('Executing action', { actionId });
 
     try {
+      // Get action details before execution for logging
+      const action = await actionsRepo.findById(actionId);
+
       await this.actionManager.executeAction(actionId);
       logger.info('Action executed', { actionId });
+
+      // Save decision to experiments log
+      if (action) {
+        const loader = new ContextLoader();
+        await loader.saveExperiment(
+          `Выполнено действие: **${action.action_type}**\n\nПараметры:\n\`\`\`json\n${JSON.stringify(action.action_data, null, 2)}\n\`\`\``,
+          `Причина: ${action.ai_reasoning || 'Не указана'}\nКампания: ${action.campaign_id}`
+        );
+      }
     } catch (error) {
       logger.error('Failed to execute action', { actionId, error });
       throw error;
@@ -446,6 +723,106 @@ export class Orchestrator {
   async rejectAction(actionId: string): Promise<void> {
     logger.info('Rejecting action', { actionId });
     await this.actionManager.rejectAction(actionId);
+  }
+
+  /**
+   * Approve proposal and start implementation
+   */
+  async approveProposal(proposalId: string): Promise<void> {
+    logger.info('Approving proposal', { proposalId });
+
+    try {
+      // 1. Get proposal
+      const proposal = await proposalsRepo.getById(proposalId);
+      if (!proposal) {
+        throw new Error('Proposal not found');
+      }
+
+      if (proposal.status !== 'draft' && proposal.status !== 'discussing') {
+        throw new Error(`Proposal is in ${proposal.status} state`);
+      }
+
+      // 2. Parse instruction file
+      const instructions = JSON.parse(proposal.instruction_file || '{}');
+
+      // 3. Create campaign via Yandex API
+      // Map instructions to Yandex API calls
+      // instructions.campaignStructure contains the data
+      const structure = instructions.campaignStructure;
+
+      if (!structure || !structure.strategy) {
+        throw new Error('Invalid proposal structure: missing strategy');
+      }
+
+      // Determine strategy type for API
+      // Mapping from our internal simplified types to Yandex types
+      let strategyType:
+        | 'WB_MAXIMUM_CLICKS'
+        | 'WB_MAXIMUM_CONVERSION_RATE'
+        | 'AVERAGE_CPA'
+        | 'AVERAGE_ROI'
+        | 'WEEKLY_CLICK_PACKAGE'
+        | 'MANUAL_CPM' = 'WB_MAXIMUM_CLICKS';
+
+      const stratName = structure.strategy.name?.toLowerCase() || '';
+      if (stratName.includes('cpa')) strategyType = 'AVERAGE_CPA';
+      else if (stratName.includes('roi')) strategyType = 'AVERAGE_ROI';
+      else if (stratName.includes('conversion')) strategyType = 'WB_MAXIMUM_CONVERSION_RATE';
+      else if (stratName.includes('manual')) strategyType = 'MANUAL_CPM'; // Or manual search, but Yandex API v5 often uses strategies even for manual
+
+      // Parse budget
+      const budget = parseFloat(structure.strategy.budget) || 1000; // Default 1000 rub
+
+      const yandexCampaignId = await this.yandex.createCampaign(
+        proposal.title,
+        new Date().toISOString().split('T')[0], // Start today
+        budget / 7, // Daily budget approx
+        strategyType
+      );
+
+      // 4. Create campaign in local DB immediately
+      await campaignsRepo.upsertFromYandex(
+        yandexCampaignId,
+        proposal.title,
+        'active', // Assuming it's created as active/draft but we track it
+        { generated_from_proposal: proposal.id }
+      );
+
+      // 5. Update proposal status
+      await proposalsRepo.update(proposal.id, {
+        status: 'implemented', // Changed from 'approved' to 'implemented' to signify it's done
+      });
+
+      // 5. Log the decision
+      const loader = new ContextLoader();
+      await loader.saveExperiment(
+        `Утверждено предложение: **${proposal.title}**\n\nСтруктура:\n\`\`\`json\n${JSON.stringify(instructions.campaignStructure, null, 2)}\n\`\`\``,
+        `Причина: ${proposal.reasoning}\nПредложение: ${proposal.id}`
+      );
+
+      logger.info('Proposal approved and processed', { proposalId, yandexCampaignId });
+    } catch (error) {
+      logger.error('Failed to approve proposal', { proposalId, error });
+      throw error;
+    }
+  }
+
+  /**
+   * Reject proposal
+   */
+  async rejectProposal(proposalId: string): Promise<void> {
+    logger.info('Rejecting proposal', { proposalId });
+
+    try {
+      await proposalsRepo.update(proposalId, {
+        status: 'rejected',
+      });
+
+      logger.info('Proposal rejected', { proposalId });
+    } catch (error) {
+      logger.error('Failed to reject proposal', { proposalId, error });
+      throw error;
+    }
   }
 
   /**
@@ -545,6 +922,14 @@ export class Orchestrator {
         }
         logger.info(`Extracted ${summary.keyFacts.length} facts from conversation`);
       }
+
+      // Save summary to auto-insights file
+      const loader = new ContextLoader();
+      await loader.saveLearning(
+        `### Диалог (ID: ${session.currentConversationId.substring(0, 8)})\n\n**Тема:** ${summary.topic}\n\n**Резюме:** ${summary.summary}\n\n**Выводы:**\n${(summary.decisions || []).map((d) => `- ${d}`).join('\n')}`,
+        'auto',
+        `conversation/${session.currentConversationId}`
+      );
     } catch (error) {
       logger.error('Failed to archive conversation', { error, userId });
       // Don't block the flow if summarization fails
@@ -815,9 +1200,11 @@ export class Orchestrator {
 • CPA: ${cpa > 0 ? cpa.toLocaleString('ru-RU', { style: 'currency', currency: 'RUB' }) : 'N/A'}
 
 *Анализ:*
-${analysis.text}
+${escapeMarkdown(analysis.text)}
 
-${analysis.insights && analysis.insights.length > 0 ? `*Инсайты:*\n${analysis.insights.map((i) => `• ${i}`).join('\n')}` : ''}`;
+${analysis.insights && analysis.insights.length > 0 ? `*Инсайты:*\n${analysis.insights.map((i) => `• ${escapeMarkdown(i)}`).join('\n')}` : ''}
+
+${analysis.recommendations && analysis.recommendations.length > 0 ? `*Рекомендации:*\n${analysis.recommendations.map((r) => `💡 *${escapeMarkdown(r.title)}*\n${escapeMarkdown(r.description)}`).join('\n\n')}` : ''}`;
   }
 
   /**
@@ -848,9 +1235,9 @@ ${analysis.insights && analysis.insights.length > 0 ? `*Инсайты:*\n${anal
 • CPA: ${cpa > 0 ? cpa.toLocaleString('ru-RU', { style: 'currency', currency: 'RUB' }) : 'N/A'}
 
 *Анализ:*
-${analysis.text}
+${escapeMarkdown(analysis.text)}
 
-${analysis.summary ? `*Резюме:*\n${analysis.summary}` : ''}`;
+${analysis.summary ? `*Резюме:*\n${escapeMarkdown(analysis.summary)}` : ''}`;
   }
 }
 

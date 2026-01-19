@@ -67,12 +67,25 @@ export class ContextManager {
   async getCampaignContext(campaignId: string): Promise<CampaignContext | null> {
     logger.debug('Getting campaign context', { campaignId });
 
-    // Get campaign info
-    const campaignResult = await query<{
-      id: string;
-      yandex_id: string;
-      name: string;
-    }>('SELECT * FROM campaigns WHERE id = $1 OR yandex_id = $1', [campaignId]);
+    // Check if campaignId is a UUID
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      campaignId
+    );
+
+    let campaignResult;
+    if (isUuid) {
+      campaignResult = await query<{
+        id: string;
+        yandex_id: string;
+        name: string;
+      }>('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
+    } else {
+      campaignResult = await query<{
+        id: string;
+        yandex_id: string;
+        name: string;
+      }>('SELECT * FROM campaigns WHERE yandex_id = $1', [campaignId]);
+    }
 
     if (campaignResult.rows.length === 0) {
       return null;

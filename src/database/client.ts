@@ -36,18 +36,18 @@ export function initDatabase(config: DatabaseConfig): Pool {
   });
 
   pool.on('connect', () => {
-    logger.debug('New client connected to database');
+    // logger.debug('New client connected to database'); // Disabled to reduce noise
   });
 
   pool.on('error', (err) => {
     logger.error('Unexpected error on idle client', { error: err.message });
   });
 
-  logger.info('Database pool initialized', {
-    host: config.host,
-    port: config.port,
-    database: config.database,
-  });
+  // logger.info('Database pool initialized', { // Disabled to reduce noise
+  //   host: config.host,
+  //   port: config.port,
+  //   database: config.database,
+  // });
 
   return pool;
 }
@@ -73,11 +73,14 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   const result = await getPool().query<T>(text, params);
   const duration = Date.now() - start;
 
-  logger.debug('Executed query', {
-    text: text.substring(0, 100),
-    duration,
-    rows: result.rowCount,
-  });
+  // Only log slow queries or errors (errors are handled by caller/pool)
+  if (duration > 1000) {
+    logger.warn('Slow query detected', {
+      text: text.substring(0, 200),
+      duration,
+      rows: result.rowCount,
+    });
+  }
 
   return result;
 }
@@ -93,9 +96,7 @@ export async function getClient(): Promise<PoolClient> {
 /**
  * Execute a transaction
  */
-export async function transaction<T>(
-  callback: (client: PoolClient) => Promise<T>
-): Promise<T> {
+export async function transaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await getClient();
 
   try {
@@ -118,7 +119,7 @@ export async function closeDatabase(): Promise<void> {
   if (pool) {
     await pool.end();
     pool = null;
-    logger.info('Database pool closed');
+    // logger.info('Database pool closed'); // Disabled to reduce noise
   }
 }
 

@@ -5,6 +5,7 @@ import {
   createCampaignKeyboard,
   createRecommendationKeyboard,
   createProposalKeyboard,
+  createProposalActionKeyboard,
   createCampaignClarificationKeyboard,
   createProposalClarificationKeyboard,
   createCurrentContextKeyboard,
@@ -32,18 +33,28 @@ export interface ClarificationResponse {
 
 // Orchestrator interface (will be injected)
 export interface Orchestrator {
-  generateDailyReport(): Promise<{ text: string; recommendations: unknown[] }>;
-  generateWeeklyReport(): Promise<{ text: string; recommendations: unknown[] }>;
+  generateDailyReport(
+    sendToTelegram?: boolean
+  ): Promise<{ text: string; recommendations: unknown[] }>;
+  generateWeeklyReport(
+    sendToTelegram?: boolean
+  ): Promise<{ text: string; recommendations: unknown[] }>;
   getCampaigns(filter?: 'active' | 'all'): Promise<{ id: string; name: string; status?: string }[]>;
   getProposals(): Promise<{ id: string; title: string; status: string }[]>;
   handleUserQuestion(question: string, userId: string): Promise<string | ClarificationResponse>;
   executeAction(actionId: string): Promise<void>;
   rejectAction(actionId: string): Promise<void>; // New
   explainAction(actionId: string): Promise<string>; // New
+  approveProposal(proposalId: string): Promise<void>;
+  rejectProposal(proposalId: string): Promise<void>;
   getAIUsageStats(): string;
   setCurrentCampaign(userId: string, campaignId: string): Promise<void>;
   setCurrentProposal(userId: string, proposalId: string): Promise<void>;
   clearCurrentContext(userId: string): Promise<void>;
+  generateCampaignProposal(
+    userRequest: string,
+    userId: string
+  ): Promise<{ proposalId: string; title: string; content: any }>;
   getCurrentContext(userId: string): Promise<{
     campaign?: { id: string; name: string };
     proposal?: { id: string; title: string };
@@ -155,7 +166,7 @@ export async function handleReport(ctx: BotContext): Promise<void> {
   await ctx.reply('⏳ Генерирую отчёт за вчера...');
 
   try {
-    const report = await orchestrator.generateDailyReport();
+    const report = await orchestrator.generateDailyReport(false); // Don't send duplicate
 
     await ctx.reply(report.text, { parse_mode: 'Markdown' });
 
@@ -190,7 +201,7 @@ export async function handleWeekReport(ctx: BotContext): Promise<void> {
   await ctx.reply('⏳ Генерирую недельный отчёт...');
 
   try {
-    const report = await orchestrator.generateWeeklyReport();
+    const report = await orchestrator.generateWeeklyReport(false); // Don't send duplicate
     await ctx.reply(report.text, { parse_mode: 'Markdown' });
   } catch (error) {
     logger.error('Failed to generate weekly report', { error });
@@ -595,6 +606,34 @@ export async function handleCallback(ctx: BotContext): Promise<void> {
         await handlePeriodCallback(ctx, param);
         break;
 
+      case 'proposal_approve':
+        await ctx.answerCbQuery('Утверждаю...');
+        if (orchestrator) {
+          try {
+            await orchestrator.approveProposal(param);
+            await ctx.editMessageText('✅ Предложение утверждено! Кампания создается...');
+          } catch (error) {
+            logger.error('Failed to approve proposal', { error });
+            await ctx.reply('❌ Ошибка при утверждении');
+          }
+        }
+        break;
+
+      case 'proposal_reject':
+        await ctx.answerCbQuery('Отклонено');
+        if (orchestrator) {
+          await orchestrator.rejectProposal(param);
+          await ctx.editMessageText('❌ Предложение отклонено');
+        }
+        break;
+
+      case 'proposal_edit':
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          '✏️ Напишите, что нужно изменить в предложении.\n\nЯ проанализирую ваш запрос и обновлю структуру.'
+        );
+        break;
+
       case 'back':
         await ctx.answerCbQuery();
         await ctx.editMessageText('Выберите действие:', {
@@ -895,6 +934,53 @@ export async function handleSync(ctx: BotContext, mode?: string): Promise<void> 
   }
 }
 
+/**
+ * Handle /create_campaign command
+ */
+export async function handleCreateCampaign(ctx: BotContext, description: string): Promise<void> {
+  if (!orchestrator) {
+    await ctx.reply('⚠️ Система ещё не инициализирована');
+    return;
+  }
+
+  if (!description.trim()) {
+    await ctx.reply(
+      '💡 Опишите, какую кампанию вы хотите создать.\n\nПример: /create_campaign Реклама пластиковых окон в Москве, бюджет 50000 руб'
+    );
+    return;
+  }
+
+  logger.info('Create campaign command received', { userId: ctx.from?.id, description });
+
+  await ctx.reply('🤔 Анализирую запрос и генерирую предложение...');
+
+  try {
+    const userId = ctx.from?.id?.toString() || 'unknown';
+    const result = await orchestrator.generateCampaignProposal(description, userId);
+
+    const content = result.content;
+    let message = `✅ *Предложение создано: ${result.title}*\n\n`;
+    message += `📝 *Описание:* ${content.description}\n\n`;
+    message += `🎯 *Стратегия:* ${content.campaignStructure?.strategy?.name || 'N/A'}\n`;
+    message += `💰 *Бюджет:* ${content.campaignStructure?.strategy?.budget || 'N/A'}\n\n`;
+    message += `📊 *Прогноз:* Клики: ${content.estimatedResults?.clicks}, CPA: ${content.estimatedResults?.cpa}\n\n`;
+
+    if (content.questions && content.questions.length > 0) {
+      message += `❓ *Вопросы:*\n${content.questions.map((q: string) => `• ${q}`).join('\n')}\n\n`;
+    }
+
+    message += `Контекст переключён на это предложение. Вы можете обсуждать его и вносить правки.`;
+
+    await ctx.reply(message, {
+      parse_mode: 'Markdown',
+      reply_markup: createProposalActionKeyboard(result.proposalId),
+    });
+  } catch (error) {
+    logger.error('Failed to create campaign proposal', { error });
+    await ctx.reply('❌ Не удалось создать предложение. Попробуйте позже.');
+  }
+}
+
 export default {
   setOrchestrator,
   isAuthorized,
@@ -916,4 +1002,5 @@ export default {
   handleListContext,
   handleClearKnowledge,
   handleSync,
+  handleCreateCampaign,
 };

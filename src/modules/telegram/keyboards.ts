@@ -222,6 +222,21 @@ export function createCurrentContextKeyboard(
 }
 
 /**
+ * Create inline keyboard for proposal actions
+ */
+export function createProposalActionKeyboard(proposalId: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Утвердить', callback_data: `proposal_approve:${proposalId}` },
+        { text: '✏️ Изменить', callback_data: `proposal_edit:${proposalId}` },
+      ],
+      [{ text: '❌ Отклонить', callback_data: `proposal_reject:${proposalId}` }],
+    ],
+  };
+}
+
+/**
  * Remove inline keyboard
  */
 export function removeKeyboard(): { remove_keyboard: true } {
@@ -239,6 +254,7 @@ export default {
   createCampaignClarificationKeyboard,
   createProposalClarificationKeyboard,
   createProposalKeyboard,
+  createProposalActionKeyboard,
   createCurrentContextKeyboard,
   removeKeyboard,
 };

@@ -21,7 +21,7 @@ export interface LoadContextResult {
 
 /**
  * Context Loader - загружает .md файлы из папки context/ в базу знаний
- * 
+ *
  * Файлы хранятся как файлы на диске (для удобства редактирования),
  * но при загрузке парсятся и сохраняются в таблицу knowledge_base
  * с source='initial_context' для использования AI.
@@ -229,10 +229,10 @@ export class ContextLoader {
 
     if (existing.rows.length > 0) {
       // Update existing fact
-      await query(
-        `UPDATE knowledge_base SET fact = $1, confidence = 1.0 WHERE id = $2`,
-        [fact, existing.rows[0].id]
-      );
+      await query(`UPDATE knowledge_base SET fact = $1, confidence = 1.0 WHERE id = $2`, [
+        fact,
+        existing.rows[0].id,
+      ]);
     } else {
       // Insert new fact
       await query(
@@ -281,9 +281,9 @@ export class ContextLoader {
     for (const category of categories) {
       const categoryPath = path.join(this.contextPath, category);
       if (fs.existsSync(categoryPath)) {
-        const files = fs.readdirSync(categoryPath).filter(
-          (f) => f.endsWith('.md') && f !== 'README.md'
-        );
+        const files = fs
+          .readdirSync(categoryPath)
+          .filter((f) => f.endsWith('.md') && f !== 'README.md');
         if (files.length > 0) {
           result.push({ category, files });
         }
@@ -292,6 +292,99 @@ export class ContextLoader {
 
     return result;
   }
+
+  /**
+   * Save learning/insight to markdown file
+   */
+  async saveLearning(
+    content: string,
+    type: 'auto' | 'weekly' = 'auto',
+    source?: string
+  ): Promise<void> {
+    logger.info('Saving learning', { type });
+
+    try {
+      const learningsPath = path.join(this.contextPath, 'learnings');
+      if (!fs.existsSync(learningsPath)) {
+        fs.mkdirSync(learningsPath, { recursive: true });
+      }
+
+      let filename: string;
+      let header: string;
+
+      if (type === 'weekly') {
+        const now = new Date();
+        const year = now.getFullYear();
+        const week = getWeekNumber(now);
+        filename = `week-${year}-${week}.md`;
+        header = `# Недельный отчёт ${year}-${week}\n\n`;
+      } else {
+        filename = 'auto-insights.md';
+        header = `# Автоматические инсайты\n\n`;
+      }
+
+      const filePath = path.join(learningsPath, filename);
+      const dateStr = new Date().toISOString().split('T')[0];
+      const entry = `## [${dateStr}] ${source ? `Source: ${source}` : ''}\n\n${content}\n\n`;
+
+      if (fs.existsSync(filePath)) {
+        fs.appendFileSync(filePath, entry);
+      } else {
+        fs.writeFileSync(filePath, header + entry);
+      }
+
+      // Also reload this file into knowledge base
+      await this.loadFile(filePath, 'learnings', {
+        loaded: 0,
+        skipped: 0,
+        errors: [],
+        files: [],
+      });
+    } catch (error) {
+      logger.error('Failed to save learning', { error });
+    }
+  }
+
+  /**
+   * Save experiment/decision to markdown file
+   */
+  async saveExperiment(decision: string, context: string): Promise<void> {
+    logger.info('Saving experiment decision');
+
+    try {
+      const experimentsPath = path.join(this.contextPath, 'experiments');
+      if (!fs.existsSync(experimentsPath)) {
+        fs.mkdirSync(experimentsPath, { recursive: true });
+      }
+
+      const filePath = path.join(experimentsPath, 'decisions.md');
+      const dateStr = new Date().toISOString().split('T')[0];
+      const entry = `## [${dateStr}] Решение\n\n${decision}\n\n### Контекст\n${context}\n\n---\n\n`;
+
+      if (fs.existsSync(filePath)) {
+        fs.appendFileSync(filePath, entry);
+      } else {
+        fs.writeFileSync(filePath, `# Журнал решений\n\n${entry}`);
+      }
+
+      // Reload
+      await this.loadFile(filePath, 'experiments', {
+        loaded: 0,
+        skipped: 0,
+        errors: [],
+        files: [],
+      });
+    } catch (error) {
+      logger.error('Failed to save experiment', { error });
+    }
+  }
+}
+
+function getWeekNumber(d: Date): number {
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
 }
 
 export default ContextLoader;
